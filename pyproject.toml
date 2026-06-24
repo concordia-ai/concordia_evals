@@ -1,0 +1,84 @@
+[project]
+name = "concordia-evals"
+version = "0.1.0"
+description = "Inspect-native evaluations maintained by Concordia AI"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Concordia AI" },
+]
+keywords = ["inspect", "eval", "concordia"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "inspect_ai >= 0.3.221",
+    "datasets >= 4.8.5",
+    "huggingface-hub >= 1.2.0",
+    "docker",
+    "platformdirs",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/concordia-ai/concordia_evals"
+Repository = "https://github.com/concordia-ai/concordia_evals"
+
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "D", "NPY", "PLE", "PLR", "PLW"]
+ignore = ["E501", "D10", "D212", "D415", "PLR0911", "PLR0912", "PLR0913", "PLR0915"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["PLR2004"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+disallow_untyped_calls = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+extra_checks = true
+
+[[tool.mypy.overrides]]
+module = ["docker", "docker.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["datasets", "datasets.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "dataset_download: tests that download datasets",
+]
