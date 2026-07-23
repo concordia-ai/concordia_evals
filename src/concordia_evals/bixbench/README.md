@@ -35,7 +35,7 @@ eval(bixbench, model="openai/gpt-4o")
 - `data_dir` (Path | str | None): Directory for downloaded capsule data (default: `None`)
 - `limit` (int | None): Maximum number of samples to include (default: `None`)
 - `avoid_images` (bool): Whether to instruct the agent to avoid plots/images (default: `True`)
-- `judge_model` (str | None): Model to use for grading open-ended answers (default: `None`)
+- `judge_model` (str | None): Model to use for grading open-ended answers. If not provided, the `INSPECT_EVALS_JUDGE_MODEL` environment variable is used; otherwise it defaults to `openai/gpt-4o`.
 
 ## Docker environment
 
@@ -62,3 +62,18 @@ BixBench uses an LLM-as-a-judge scorer for open-ended questions. The grading mod
 ## Dataset
 
 The dataset contains bioinformatics research questions with open-ended questions, ground-truth answers, distractor answers (for MCQ evaluation, not used in open mode), and associated data files in ZIP format. The full dataset has ~100 questions. Use `--limit` to evaluate on a subset.
+
+## Quick test with a mock model
+
+To verify the task runs through the Inspect pipeline without making real API calls, you can use the built-in `mockllm/model` and point `data_dir` at a local cache of capsule data:
+
+```bash
+uv run inspect eval src/concordia_evals/bixbench/bixbench.py@bixbench \
+  --model mockllm/model \
+  --limit 1 \
+  -T max_messages=5 \
+  -T judge_model=mockllm/model \
+  -T data_dir=/path/to/cached/capsule/data
+```
+
+`mockllm/model` returns deterministic placeholder text, so the resulting accuracy will be `0.0`; the purpose of this command is only to exercise the dataset loading, sandbox setup, tools, and scorer code paths.

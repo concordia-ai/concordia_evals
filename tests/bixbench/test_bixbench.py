@@ -92,6 +92,7 @@ def test_bixbench_task_creation() -> None:
     sample = task.dataset[0]
     assert sample.id is not None
     assert sample.target is not None
+    assert sample.metadata is not None
     assert "question" in sample.metadata
     assert "ideal" in sample.metadata
     assert sample.sandbox is not None
