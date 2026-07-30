@@ -48,10 +48,10 @@ Each BixBench sample runs in an isolated Docker container based on the `jingedaw
 If you prefer to build the image locally:
 
 ```bash
-docker build -t jingedawang/bixbench-inspect-env:latest --platform linux/amd64 .
+docker build -t jingedawang/bixbench-inspect-env:latest --platform linux/amd64 -f src/concordia_evals/bixbench/Dockerfile src/concordia_evals/bixbench
 ```
 
-The `Dockerfile` in the repository root uses four Bioconductor annotation data packages (`GenomeInfoDbData`, `GO.db`, `HDO.db`, `org.Hs.eg.db`). These packages are **not** tracked in this repository. If you place the corresponding `.tar.gz` files in the same directory as the `Dockerfile`, the build will use them directly; otherwise the Dockerfile will download them from Bioconductor automatically (requires Docker BuildKit).
+The `Dockerfile` in `src/concordia_evals/bixbench/` uses four Bioconductor annotation data packages (`GenomeInfoDbData`, `GO.db`, `HDO.db`, `org.Hs.eg.db`). These packages are **not** tracked in this repository. If you place the corresponding `.tar.gz` files in the same directory as the `Dockerfile`, the build will use them directly; otherwise the Dockerfile will download them from Bioconductor automatically (requires Docker BuildKit).
 
 ## Scoring
 
