@@ -43,7 +43,7 @@ from platformdirs import user_cache_dir
 
 BIXBENCH_CACHE_PATH = Path(user_cache_dir("concordia-evals"))
 
-FILE_DIR = Path(__file__).parent.parent.parent.parent
+FILE_DIR = Path(__file__).parent
 DEFAULT_DATA_DIR = BIXBENCH_CACHE_PATH / "bixbench" / "data"
 COMPOSE_FILES_DIR = BIXBENCH_CACHE_PATH / "bixbench" / "compose_files"
 DEFAULT_IMAGE_NAME = "jingedawang/bixbench-inspect-env:latest"
