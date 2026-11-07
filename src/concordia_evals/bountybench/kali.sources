@@ -1,0 +1,5 @@
+Types: deb
+URIs: http://mirrors.tuna.tsinghua.edu.cn/kali/
+Suites: kali-last-snapshot
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg
