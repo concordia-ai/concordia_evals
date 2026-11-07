@@ -11,6 +11,7 @@ This repository is **not** part of the official [`inspect_evals`](https://github
 | Evaluation | Description |
 |------------|-------------|
 | [BixBench](src/concordia_evals/bixbench) | Evaluates language model agents on bioinformatics data analysis tasks. Agents analyze biological datasets using Jupyter notebooks and answer open-ended research questions. |
+| [WebExploitBench](src/concordia_evals/web_exploit_bench) | Measures how well agents find and exploit vulnerabilities in live, deliberately vulnerable web applications, scored with the benchmark's per-vulnerability verifiers plus an LLM judge. |
 
 ## Installation
 
