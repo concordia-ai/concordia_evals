@@ -14,9 +14,10 @@ The three task types are graded the way the upstream agents grade them:
 import json
 import logging
 import shutil
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from inspect_ai.scorer import (
     CORRECT,
@@ -53,6 +54,7 @@ from concordia_evals.bountybench.environment import (
     run_container_script,
     run_script_in_sandbox,
     sandbox_git_diff,
+    set_sandbox_egress,
     sh,
     snapshot_workspace,
     upload_tree,
@@ -149,6 +151,21 @@ async def _prepare_grading_tree(
     await sh(sbx, f"ln -sfn {SANDBOX_CODEBASE_DIR} {SANDBOX_GRADING_TREE}/codebase")
 
 
+@asynccontextmanager
+async def _dataset_script_egress(sbx: SandboxEnvironment) -> AsyncIterator[None]:
+    """Give a dataset script the network for the duration of its run.
+
+    The agent's container has no internet access; the grading scripts of the
+    tasks install their own dependencies, so they run inside this window. The
+    agent's own code (`exploit.sh`) is deliberately run outside of it.
+    """
+    await set_sandbox_egress(sbx, True)
+    try:
+        yield
+    finally:
+        await set_sandbox_egress(sbx, False)
+
+
 async def _run_agent_exploit(
     sbx: SandboxEnvironment, spec: BountySpec
 ) -> ExecResult[str]:
@@ -169,6 +186,7 @@ async def _run_agent_exploit(
         ]
     )
     await sbx.write_file(f"{SANDBOX_EXPLOIT_DIR}/run_exploit.sh", script)
+    await set_sandbox_egress(sbx, False)
     return await run_script_in_sandbox(
         sbx, SANDBOX_EXPLOIT_DIR, "run_exploit.sh", timeout=EXPLOIT_TIMEOUT
     )
@@ -188,9 +206,10 @@ async def _run_reference_exploit(
     await _prepare_grading_tree(sbx, workspace, with_reference=True)
     exploit_dir = f"{SANDBOX_GRADING_TREE}/{relative}"
     await sh(sbx, f"chmod -R +x {exploit_dir} || true")
-    return await run_script_in_sandbox(
-        sbx, exploit_dir, "exploit.sh", timeout=EXPLOIT_TIMEOUT
-    )
+    async with _dataset_script_egress(sbx):
+        return await run_script_in_sandbox(
+            sbx, exploit_dir, "exploit.sh", timeout=EXPLOIT_TIMEOUT
+        )
 
 
 async def _run_verify(
@@ -228,17 +247,19 @@ async def _run_verify(
     if reference:
         # The caller uploaded the tree and the reference exploit wrote its
         # artefacts into it; re-uploading would discard them.
-        return await run_script_in_sandbox(
-            sbx, bounty_verify_dir, "verify.sh", timeout=VERIFY_TIMEOUT
-        )
+        async with _dataset_script_egress(sbx):
+            return await run_script_in_sandbox(
+                sbx, bounty_verify_dir, "verify.sh", timeout=VERIFY_TIMEOUT
+            )
     await _prepare_grading_tree(sbx, workspace)
     await sh(
         sbx,
         f"rm -rf {SANDBOX_VERIFY_DIR} && cp -a {bounty_verify_dir} {SANDBOX_VERIFY_DIR}",
     )
-    return await run_script_in_sandbox(
-        sbx, SANDBOX_VERIFY_DIR, "verify.sh", timeout=VERIFY_TIMEOUT
-    )
+    async with _dataset_script_egress(sbx):
+        return await run_script_in_sandbox(
+            sbx, SANDBOX_VERIFY_DIR, "verify.sh", timeout=VERIFY_TIMEOUT
+        )
 
 
 async def _sync_agent_workspace(sbx: SandboxEnvironment, workspace: Workspace) -> Path:
@@ -352,9 +373,10 @@ async def _run_invariant_script(
             scores_path.unlink()
         return scores, f"{result.stdout}\n{result.stderr}"
 
-    result = await run_script_in_sandbox(
-        sbx, directory.as_posix(), script, timeout=INVARIANTS_TIMEOUT
-    )
+    async with _dataset_script_egress(sbx):
+        result = await run_script_in_sandbox(
+            sbx, directory.as_posix(), script, timeout=INVARIANTS_TIMEOUT
+        )
     scores_path = directory / "invariant_scores.json"
     content = await sh(sbx, f"cat {scores_path} 2>/dev/null || true")
     await sh(sbx, f"rm -f {scores_path}")

@@ -22,7 +22,11 @@ from concordia_evals.bountybench.data import (
     list_bounty_specs,
     record_to_sample,
 )
-from concordia_evals.bountybench.environment import _is_safe_member, tree_filter
+from concordia_evals.bountybench.environment import (
+    _is_safe_member,
+    install_script,
+    tree_filter,
+)
 from concordia_evals.bountybench.prompts import (
     EXPLOIT_PROMPT,
     get_initial_prompt,
@@ -285,7 +289,7 @@ def test_record_to_sample_builds_prompt_metadata_and_sandbox(
         data, "ensure_codebase_mirror", lambda spec, cache_dir=None: mirror
     )
     monkeypatch.setattr(
-        data, "sandbox_compose_file", lambda spec, cache_dir=None: compose
+        data, "sandbox_compose_file", lambda spec, image=None, cache_dir=None: compose
     )
 
     sample = record_to_sample(spec, "exploit")
@@ -423,3 +427,26 @@ def _git(directory: Path, *args: str) -> str:
         ["git", *args], cwd=directory, capture_output=True, text=True, check=True
     )
     return result.stdout
+
+
+def test_install_script_matches_the_upstream_install(tmp_path: Path) -> None:
+    """The repository is installed while building the sandbox image."""
+    python_repo = tmp_path / "python"
+    python_repo.mkdir()
+    (python_repo / "pyproject.toml").write_text("[build-system]\n")
+    c_repo = tmp_path / "c"
+    c_repo.mkdir()
+    (c_repo / "CMakeLists.txt").write_text("project(demo)\n")
+    node_repo = tmp_path / "node"
+    node_repo.mkdir()
+    (node_repo / "package.json").write_text("{}")
+
+    assert install_script(python_repo, None, None) == "pip install -e ."
+    assert install_script(c_repo, None, None) == "make install"
+    # node repositories are not installed, as upstream
+    assert install_script(node_repo, None, None) is None
+    # the install command and `is_python` of the metadata win over detection
+    assert install_script(python_repo, "pip install .", None) == "pip install ."
+    assert install_script(c_repo, "make -C . install", None) == "make -C . install"
+    assert install_script(python_repo, None, True) == "pip install -e ."
+    assert install_script(python_repo, None, False) is None

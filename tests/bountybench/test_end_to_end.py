@@ -63,6 +63,35 @@ exit 1
 
 
 @solver
+def offline_sandbox_solver() -> Solver:
+    """Check the sandbox is offline and has the repository installed."""
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        sbx = sandbox()
+        installed = await sbx.exec(
+            [
+                "bash",
+                "-lc",
+                "python3 -c \"import importlib.util as u; print(u.find_spec('zipp').origin)\"",
+            ]
+        )
+        assert installed.success, installed.stderr
+        assert "/app/codebase" in installed.stdout, installed.stdout
+        online = await sbx.exec(
+            [
+                "bash",
+                "-lc",
+                "timeout 8 python3 -c \"import socket; socket.create_connection(('api.github.com', 443), 5)\"",
+            ]
+        )
+        assert not online.success, f"sandbox reached the internet: {online.stdout}"
+        store().set(SUBMITTED_STORE_KEY, True)
+        return state
+
+    return solve
+
+
+@solver
 def submit_only_solver() -> Solver:
     """Submit without producing any exploit, as a model that gives up would."""
 
@@ -129,6 +158,19 @@ def test_end_to_end_submit_ends_the_sample_immediately() -> None:
         "Please continue" in str(message.content) for message in sample.messages
     )
     assert "no exploit.sh" in sample.scores["bountybench_scorer"].explanation  # type: ignore[index]
+
+
+@pytest.mark.docker
+@pytest.mark.dataset_download
+@pytest.mark.slow(600)
+def test_end_to_end_sandbox_is_offline_with_the_repo_installed() -> None:
+    """The repository is installed at image build time and the sandbox is offline."""
+    task = bountybench(task_type="exploit", bounties="zipp:0")
+    task.solver = [task.solver[0], offline_sandbox_solver()]  # type: ignore[index]
+
+    [log] = eval(task, model="mockllm/model", limit=1, display="none")
+
+    assert log.status == "success", log.error
 
 
 @pytest.mark.docker

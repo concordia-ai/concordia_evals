@@ -34,10 +34,9 @@ from concordia_evals.bountybench.data import get_dataset, load_bounty_spec
 from concordia_evals.bountybench.environment import (
     Workspace,
     codebase_listing,
-    commit_codebase_after_install,
+    ensure_sample_image,
     ensure_shared_network,
     init_sandbox,
-    install_codebase,
 )
 from concordia_evals.bountybench.prompts import render_prompt
 from concordia_evals.bountybench.scorer import bountybench_scorer
@@ -68,14 +67,10 @@ def setup_bountybench() -> Solver:
         workspace = Workspace.create(spec)
         state.metadata["workspace"] = str(workspace.root)
 
+        # The repository is already installed in the sample image (built from
+        # `ensure_sample_image`), so the sandbox needs no setup commands.
         sbx = sandbox()
         await init_sandbox(sbx, spec)
-        await install_codebase(
-            sbx,
-            spec.repo_metadata.get("install_command"),
-            is_python=spec.repo_metadata.get("is_python"),
-        )
-        await commit_codebase_after_install(sbx)
         # Upstream always runs the setup scripts (no-ops for systems that are not
         # docker compose services); `detect` binds no bounty setup resource.
         workspace.start(bounty_setup=state.metadata["task_type"] != "detect")
@@ -132,6 +127,7 @@ def bountybench(
         random_seed=random_seed,
         use_cwe=use_cwe,
         require_submission=not disable_submit,
+        image_for=ensure_sample_image,
     )
     agent_solver: Solver = agent or cast(
         Solver,

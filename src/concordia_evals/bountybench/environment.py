@@ -30,11 +30,14 @@ from typing import Callable
 from inspect_ai.util import ExecResult, SandboxEnvironment
 
 from concordia_evals.bountybench.constants import (
+    AGENT_DOCKERFILE,
     AGENT_IMAGE,
+    AGENT_IMAGE_NAME,
     CODEBASE_TREE_IGNORE,
     CODEBASE_TREE_MAX_TOKENS,
     HEALTHCHECK_TIMEOUT,
     INSTALL_TIMEOUT,
+    SAMPLE_IMAGES_DIR,
     SANDBOX_APP_DIR,
     SANDBOX_CODEBASE_DIR,
     SANDBOX_EXPLOIT_DIR,
@@ -43,9 +46,15 @@ from concordia_evals.bountybench.constants import (
     SHARED_NETWORK,
     WORKSPACES_DIR,
 )
-from concordia_evals.bountybench.data import BountySpec, ensure_codebase_mirror
+from concordia_evals.bountybench.data import (
+    BountySpec,
+    checkout_codebase,
+    ensure_codebase_mirror,
+)
 
 logger = logging.getLogger(__name__)
+
+PACKAGE_DIR = Path(__file__).parent
 
 # Fields of a `git diff --numstat` line: added, removed, path.
 NUMSTAT_FIELDS = 3
@@ -76,15 +85,167 @@ def run_host(
 
 
 def ensure_shared_network(name: str = SHARED_NETWORK) -> None:
-    """Create the upstream shared docker network if it does not exist yet."""
+    """Create the upstream shared docker network as an internal network.
+
+    The agent container is attached to this network only, so an internal network
+    is what keeps the sandbox off the internet. Target systems keep the networks
+    their compose files declare, and reach the internet through those as upstream.
+    """
     existing = run_host(["docker", "network", "ls", "--format", "{{.Name}}"])
     if existing.returncode != 0:
         raise RuntimeError(f"Docker is not available: {existing.stderr.strip()}")
     if name in existing.stdout.split():
-        return
-    created = run_host(["docker", "network", "create", name])
+        internal = run_host(
+            ["docker", "network", "inspect", "--format", "{{.Internal}}", name]
+        )
+        if internal.stdout.strip() == "true":
+            return
+        removed = run_host(["docker", "network", "rm", name])
+        if removed.returncode != 0:
+            raise RuntimeError(
+                f"docker network {name} exists without --internal and is in use, "
+                f"so the agent sandbox could reach the internet: "
+                f"{removed.stderr.strip()}. Stop the containers attached to it "
+                f"and run again."
+            )
+    created = run_host(["docker", "network", "create", "--internal", name])
     if created.returncode != 0:
         raise RuntimeError(f"Unable to create docker network {name}")
+
+
+# Default docker bridge: the only way to the internet used by this evaluation.
+EGRESS_NETWORK = "bridge"
+
+
+async def set_sandbox_egress(sbx: SandboxEnvironment, enabled: bool) -> None:
+    """Attach or detach the sandbox to the egress network.
+
+    The sandbox is only attached to the internal shared network, so it has no
+    internet access while the agent works. The dataset's grading scripts install
+    their own dependencies, so they are run inside such a window.
+    """
+    hostname = await sh(sbx, "hostname")
+    container = hostname.stdout.strip()
+    if not container:
+        logger.warning("Unable to resolve the sandbox container for network access")
+        return
+    action = "connect" if enabled else "disconnect"
+    args = ["docker", "network", action, EGRESS_NETWORK, container]
+    if not enabled:
+        args.insert(3, "-f")
+    result = run_host(args)
+    # `connect` fails when the container is already attached and `disconnect`
+    # when it is not, which is the state we want in both cases.
+    expected = ["already exists", "is not connected"]
+    if result.returncode != 0 and not any(m in result.stderr for m in expected):
+        logger.warning(
+            "docker network %s %s failed: %s", action, EGRESS_NETWORK, result.stderr
+        )
+
+
+def image_exists(tag: str) -> bool:
+    return run_host(["docker", "image", "inspect", tag]).returncode == 0
+
+
+def ensure_agent_image(tag: str = AGENT_IMAGE) -> None:
+    """Build the base sandbox image (Kali + toolchain) if it is missing."""
+    if image_exists(tag):
+        return
+    logger.info(f"Building the agent image {tag}")
+    built = run_host(
+        [
+            "docker",
+            "build",
+            "--tag",
+            tag,
+            "--file",
+            str(PACKAGE_DIR / AGENT_DOCKERFILE),
+            str(PACKAGE_DIR),
+        ],
+        timeout=INSTALL_TIMEOUT,
+    )
+    if built.returncode != 0:
+        raise RuntimeError(f"Unable to build {tag}: {built.stderr.strip()}")
+
+
+def sample_image_tag(spec: BountySpec) -> str:
+    """Image of one sample: the agent image plus the installed target repository."""
+    return f"{AGENT_IMAGE_NAME}-{spec.system}-{spec.bounty_number}:latest"
+
+
+def install_script(
+    codebase: Path, install_command: str | None, is_python: bool | None
+) -> str | None:
+    """Command that installs the repository, as upstream's Kali env does.
+
+    Returns None for repositories that are not installed (node), as upstream.
+    """
+    if is_python is None:
+        python_repo = (codebase / "setup.py").exists() or (
+            codebase / "pyproject.toml"
+        ).exists()
+    else:
+        python_repo = is_python
+    if python_repo:
+        return install_command or "pip install -e ."
+    if not (codebase / "CMakeLists.txt").exists():
+        return None
+    return install_command or "make install"
+
+
+def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -> str:
+    """Build (once) the sandbox image of a sample, with the repository installed.
+
+    Upstream installs the repository inside the running Kali container, which
+    needs the internet at that point. Doing it while building the image lets the
+    sandbox run without any external network access.
+    """
+    context = cache_dir / f"{spec.system}_bounty_{spec.bounty_number}"
+    codebase = context / "codebase"
+    checkout_codebase(ensure_codebase_mirror(spec), spec.vulnerable_commit, codebase)
+    command = install_script(
+        codebase,
+        spec.repo_metadata.get("install_command"),
+        spec.repo_metadata.get("is_python"),
+    )
+    if command is None:
+        # Nothing to install: the base image is the sample image.
+        ensure_agent_image()
+        return AGENT_IMAGE
+
+    tag = sample_image_tag(spec)
+    if image_exists(tag):
+        return tag
+
+    ensure_agent_image()
+    context.mkdir(parents=True, exist_ok=True)
+    dockerfile = context / AGENT_DOCKERFILE
+    dockerfile.write_text(
+        f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
+FROM {AGENT_IMAGE}
+RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
+    cd {SANDBOX_CODEBASE_DIR} && {command}
+"""
+    )
+    logger.info(f"Building the sandbox image {tag} ({spec.sample_id})")
+    built = run_host(
+        [
+            "docker",
+            "build",
+            "--tag",
+            tag,
+            "--file",
+            str(dockerfile),
+            str(context),
+        ],
+        timeout=INSTALL_TIMEOUT,
+    )
+    if built.returncode != 0:
+        raise RuntimeError(
+            f"Unable to build the sandbox image of {spec.sample_id}: "
+            f"{built.stderr.strip()[-2_000:]}"
+        )
+    return tag
 
 
 class Workspace:
@@ -529,12 +690,6 @@ async def init_sandbox(sbx: SandboxEnvironment, spec: BountySpec) -> None:
     )
 
 
-async def commit_codebase_after_install(sbx: SandboxEnvironment) -> None:
-    """Commit the install artefacts so they stay out of the agent's diff."""
-    for command in ("git add -A", f"git {GIT_IDENTITY} commit --quiet -m install"):
-        await sh(sbx, f"{command} || true", cwd=SANDBOX_CODEBASE_DIR)
-
-
 async def snapshot_workspace(sbx: SandboxEnvironment) -> None:
     """Commit the current workspace state (upstream `git_commit(tmp_dir)`)."""
     await sh(
@@ -551,35 +706,6 @@ async def clean_workspace(sbx: SandboxEnvironment) -> None:
         "git clean -fdq ; git checkout --quiet -- .",
         cwd=SANDBOX_APP_DIR,
     )
-
-
-async def install_codebase(
-    sbx: SandboxEnvironment, install_command: str | None, is_python: bool | None = None
-) -> None:
-    """Install the repository in editable mode, as upstream's Kali env does."""
-    if is_python is None:
-        detected = await sh(
-            sbx,
-            f"ls {SANDBOX_CODEBASE_DIR}/setup.py "
-            f"{SANDBOX_CODEBASE_DIR}/pyproject.toml 2>/dev/null || true",
-        )
-        python_repo = (
-            "setup.py" in detected.stdout or "pyproject.toml" in detected.stdout
-        )
-    else:
-        python_repo = is_python
-    if python_repo:
-        command = install_command or "pip install -e ."
-    else:
-        c_repo = await sh(
-            sbx, f"ls {SANDBOX_CODEBASE_DIR}/CMakeLists.txt 2>/dev/null || true"
-        )
-        if not c_repo.stdout.strip():
-            # Node repositories are not installed, as upstream.
-            return
-        command = install_command or "make install"
-    result = await sh(sbx, command, cwd=SANDBOX_CODEBASE_DIR, timeout=INSTALL_TIMEOUT)
-    logger.debug("install_command output:\n%s\n%s", result.stdout, result.stderr)
 
 
 async def codebase_listing(sbx: SandboxEnvironment) -> str:

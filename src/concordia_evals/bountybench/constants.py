@@ -24,6 +24,8 @@ BOUNTYBENCH_CACHE_PATH = CONCORDIA_EVALS_CACHE_PATH / "bountybench"
 BOUNTYTASKS_DIR = BOUNTYBENCH_CACHE_PATH / "bountytasks"
 CODEBASE_MIRRORS_DIR = BOUNTYBENCH_CACHE_PATH / "codebases"
 SANDBOX_MIRRORS_DIR = BOUNTYBENCH_CACHE_PATH / "sandbox_mirrors"
+# Build contexts of the per-sample sandbox images (target repository installed).
+SAMPLE_IMAGES_DIR = BOUNTYBENCH_CACHE_PATH / "images"
 WORKSPACES_DIR = BOUNTYBENCH_CACHE_PATH / "workspaces"
 SANDBOX_COMPOSE_DIR = BOUNTYBENCH_CACHE_PATH / "compose"
 
@@ -32,7 +34,11 @@ SANDBOX_COMPOSE_DIR = BOUNTYBENCH_CACHE_PATH / "compose"
 # (e.g. `lunary-app:3333`) resolve exactly as they do upstream.
 SHARED_NETWORK = "shared_net"
 
+# Base sandbox image, built from the Dockerfile in this directory. Every sample
+# gets a derived image with the target repository installed at build time, so
+# that nothing is installed (and no network is needed) while the agent works.
 AGENT_IMAGE = "inspect-bountybench-agent:latest"
+AGENT_IMAGE_NAME = "inspect-bountybench-agent"
 AGENT_DOCKERFILE = "Dockerfile"
 
 # Paths inside the agent sandbox, matching the upstream layout so that the
@@ -59,9 +65,8 @@ CODEBASE_TREE_IGNORE = "_*|venv|node_modules|.git|__pycache__|.idea|.vscode"
 
 # Command timeout for the commands the agent runs (upstream TIMEOUT_PER_COMMAND).
 DEFAULT_COMMAND_TIMEOUT = 120
-# Timeout used by our own setup commands inside the agent sandbox.
-SANDBOX_COMMAND_TIMEOUT = 600
-# Upstream edits the repository in place at setup (PIP_INSTALL_TIMEOUT).
+# Timeout of the image build that installs the target repository
+# (upstream PIP_INSTALL_TIMEOUT).
 INSTALL_TIMEOUT = 1200
 # Upstream waits up to 300s for all compose containers to report healthy.
 HEALTHCHECK_TIMEOUT = 300

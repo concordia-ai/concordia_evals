@@ -62,13 +62,13 @@ See `uv run inspect eval --help` for all available options.
 
 ## Requirements
 
-- Docker, with access to a container registry: the target systems are built from the bounties' own `Dockerfile`/`docker-compose.yml` files, and the agent image is built from the `Dockerfile` in this directory.
+- Docker, with access to a container registry: the target systems are built from the bounties' own `Dockerfile`/`docker-compose.yml` files, and the sandbox images are built from the `Dockerfile` in this directory. Every selected bounty gets a derived image with the target repository installed, so the first run builds one image per bounty (cached afterwards; roughly a minute and a few hundred MB each).
 - Free host ports for the service systems (for example `3333`/`5433`/`8080` for lunary, `5002` for mlflow). Their `verify.sh` scripts talk to `localhost:<port>` exactly as upstream.
 - For service systems, the invariant suites run on the host (as upstream), so the host needs whatever those suites require — typically `docker` and, for a few systems, Python 3.9.
 
 ## How it works
 
-A sample is one (system, bounty) pair. The agent works in a Kali Linux container that mirrors the upstream `cybench/bountyagent` environment, with the target repository checked out at the vulnerable commit under `/app`:
+A sample is one (system, bounty) pair. The agent works in a Kali Linux container that mirrors the upstream `cybench/bountyagent` environment, with the target repository checked out at the vulnerable commit under `/app`. The repository is already installed in the image, so nothing is built or downloaded while the agent works.
 
 ```
 /app/codebase        # checkout of the target repository at the vulnerable commit
@@ -79,6 +79,8 @@ A sample is one (system, bounty) pair. The agent works in a Kali Linux container
 The agent is Inspect's `react` agent with a `bash` tool and a `submit` tool: calling `submit` ends the sample immediately and hands the work to grading, so a finished agent never runs down `max_messages`. Work that is not submitted is not graded (upstream's `no_submission` outcome); pass `disable_submit=True` to grade whatever the agent left behind.
 
 For systems that run as services (`target_host` in the task metadata), the task's own `docker-compose.yml` stack is started on the evaluator host and the agent container joins the upstream `shared_net` docker network, so `target_host` hostnames (such as `lunary-app:3333`) resolve exactly as they do upstream.
+
+`shared_net` is created as an *internal* network, and it is the agent container's only network, so the agent has no internet access. The tasks' grading scripts install their own dependencies, so they run inside a short window in which the sandbox is attached to the default docker bridge; the agent's own `exploit.sh` is always run outside that window.
 
 Grading reuses the tasks' own scripts:
 
@@ -107,6 +109,7 @@ Also mirrored: prompt selection (including `bounty_setup_hosts` for the patch pr
 
 Deliberate differences:
 
+- **Repository install.** Upstream installs the repository inside the running Kali container, which needs the internet at that point. Here it is installed while building the per-sample image (same command, same editable layout under `/app/codebase`), which is what allows the sandbox itself to run offline.
 - **Agent loop.** Upstream drives a custom "Kali terminal" loop: one command per turn terminated by `<END>`, `FinalSubmissionCommand` to submit, and per-iteration re-validation of the exploit. Here the agent is Inspect's `react` agent with a `bash` tool and a `submit` tool, so the harness protocol blocks of the upstream prompts (`BASE_RESPONSE_FORMAT`, `BASE_INSTRUCTIONS`, `BASE_EXAMPLES`, `TARGET_HOST_EXAMPLE`, `SUBMISSION_INSTRUCTIONS`) are omitted. Everything task-specific (role description, provided hosts, required artefacts, `verify.sh` semantics, the bounty report and repository info) is kept verbatim — verified by diffing every prompt variant against upstream with only those blocks removed.
 - **Grading scripts run where they do upstream.** `verify.sh` and the invariant suites of service systems run on the evaluator host, because they rely on published ports, `localhost` and `docker exec <container>` (see the security note below). For systems that are not services they run inside the agent sandbox, which holds the code the exploit acted on.
 - **Agent image.** The Kali image is rebuilt from source from the upstream package list, with domestic apt/pip mirrors. `python3.11` is symlinked to the Python 3.9 built from source because a few task metadata files install with `python3.11 -m pip`. The upstream `bountytasks` Python requirements are trimmed to the libraries with wheels for that interpreter (pwntools, pycryptodome, z3, capstone, ...).
@@ -124,9 +127,10 @@ The agent has root in its container, so anything it can read there it can also u
 - **Hidden verify files stay hidden** until verification (upstream's `skip_hidden_files`).
 - **The host side never trusts sandbox output.** Archives the sandbox produces are extracted with Python's `filter="data"` (and with an explicit check for `..`, absolute paths and escaping links on older interpreters).
 
+- **No internet while the agent works.** `shared_net` is internal and is the agent's only network; the repository is installed at image build time. The one exception is the window in which a task's own grading scripts (which `pip install` their test dependencies) are executed. Note that, unlike upstream, an agent cannot install extra tools during the run: the toolchain of the image is what it has.
+
 Known limitations, all shared with upstream:
 
-- The sandbox can reach the internet, so a determined agent can read the upstream repository. Blocking it needs `docker network create --internal shared_net`, which also cuts the egress of the target services.
 - Grading for systems that are not docker services runs in the agent's own container, so a lingering background process could tamper with the scripts between the exploit and `verify.sh`.
 - Hidden verify files are readable while the exploit runs, because the verification step restores them first.
 

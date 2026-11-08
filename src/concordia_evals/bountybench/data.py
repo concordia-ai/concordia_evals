@@ -16,13 +16,12 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from inspect_ai.dataset import Dataset, MemoryDataset, Sample
 from inspect_ai.util import SandboxEnvironmentSpec
 
 from concordia_evals.bountybench.constants import (
-    AGENT_DOCKERFILE,
     AGENT_IMAGE,
     BOUNTYTASKS_COMMIT,
     BOUNTYTASKS_DIR,
@@ -334,22 +333,25 @@ def checkout_codebase(mirror: Path, commit: str, destination: Path) -> None:
 
 
 def sandbox_compose_file(
-    spec: BountySpec, cache_dir: Path = SANDBOX_COMPOSE_DIR
+    spec: BountySpec,
+    image: str = AGENT_IMAGE,
+    cache_dir: Path = SANDBOX_COMPOSE_DIR,
 ) -> Path:
-    """Write (once per system) the compose file for the agent sandbox."""
-    compose_path = cache_dir / f"{spec.system}.yaml"
-    mirror = ensure_sandbox_mirror(spec)
-    if compose_path.exists() and mirror.as_posix() in compose_path.read_text():
-        return compose_path
+    """Write (once per sample) the compose file for the agent sandbox.
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    The sandbox image has the target repository installed at build time, runs on
+    the internal shared network only and gets the pruned codebase mirror, so the
+    agent needs no network access at run time.
+    """
+    compose_path = cache_dir / f"{spec.system}_bounty_{spec.bounty_number}.yaml"
+    mirror = ensure_sandbox_mirror(spec)
+    compose_path.parent.mkdir(parents=True, exist_ok=True)
     compose_path.write_text(
         f"""services:
   default:
-    build:
-      context: {PACKAGE_DIR.as_posix()}
-      dockerfile: {AGENT_DOCKERFILE}
-    image: {AGENT_IMAGE}
+    image: {image}
+    # built locally by `ensure_sample_image`, never pulled
+    x-local: true
     init: true
     command: ["tail", "-f", "/dev/null"]
     working_dir: /app
@@ -373,6 +375,7 @@ def record_to_sample(
     task_type: str,
     use_cwe: bool = False,
     require_submission: bool = True,
+    image: str = AGENT_IMAGE,
 ) -> Sample:
     """Build an Inspect sample for one bounty and task type."""
     bounty_setup_hosts = spec.bounty_setup_hosts
@@ -385,7 +388,7 @@ def record_to_sample(
         use_cwe=use_cwe,
         cwe=str(spec.bounty_metadata.get("CWE") or ""),
     )
-    compose = sandbox_compose_file(spec)
+    compose = sandbox_compose_file(spec, image=image)
     metadata = {
         "system": spec.system,
         "bounty_number": spec.bounty_number,
@@ -420,6 +423,7 @@ def get_dataset(
     random_seed: int = 0,
     use_cwe: bool = False,
     require_submission: bool = True,
+    image_for: Callable[[BountySpec], str] | None = None,
 ) -> Dataset:
     """Build the sample set for a task type.
 
@@ -432,6 +436,8 @@ def get_dataset(
         random_seed: Seed for the subset sampling.
         use_cwe: Pass the bounty CWE to the agent (upstream `--use_cwe`).
         require_submission: Only grade work the agent submitted.
+        image_for: Resolve the sandbox image of a sample (built with the target
+            repository installed).
     """
     root = ensure_bountytasks(BOUNTYTASKS_DIR)
     specs = list_bounty_specs(root)
@@ -456,7 +462,11 @@ def get_dataset(
 
     samples = [
         record_to_sample(
-            spec, task_type, use_cwe=use_cwe, require_submission=require_submission
+            spec,
+            task_type,
+            use_cwe=use_cwe,
+            require_submission=require_submission,
+            image=image_for(spec) if image_for else AGENT_IMAGE,
         )
         for spec in specs
     ]
