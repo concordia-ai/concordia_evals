@@ -11,6 +11,7 @@ This repository is **not** part of the official [`inspect_evals`](https://github
 | Evaluation | Description |
 |------------|-------------|
 | [BixBench](src/concordia_evals/bixbench) | Evaluates language model agents on bioinformatics data analysis tasks. Agents analyze biological datasets using Jupyter notebooks and answer open-ended research questions. |
+| [ExploitGym](src/concordia_evals/exploitgym) | Tests whether agents can turn real vulnerabilities (OSS-Fuzz/ARVO userspace programs and patched Chrome V8 builds) into working exploits that capture a flag from a live target server. |
 
 ## Installation
 

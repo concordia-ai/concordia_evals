@@ -24,6 +24,8 @@ dependencies = [
     "huggingface-hub >= 1.2.0",
     "docker",
     "platformdirs",
+    "jinja2",
+    "requests",
 ]
 
 [project.optional-dependencies]
@@ -79,9 +81,13 @@ ignore_missing_imports = true
 
 [tool.setuptools.package-data]
 "concordia_evals.bixbench" = ["Dockerfile"]
+"concordia_evals.exploitgym" = ["docker/**/*", "templates/**/*"]
 
 [tool.pytest.ini_options]
+addopts = "-rA --color=yes -m 'not dataset_download'"
 asyncio_mode = "auto"
 markers = [
     "dataset_download: tests that download datasets",
+    "slow: marks tests that are slow to run; enable with --runslow or RUN_SLOW_TESTS=1",
+    "docker: marks tests that pull or build docker images",
 ]
