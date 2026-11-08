@@ -1,6 +1,9 @@
 """Unit tests for the BountyBench Inspect implementation."""
 
+import io
 import json
+import subprocess
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +11,7 @@ import pytest
 
 from concordia_evals.bountybench import data
 from concordia_evals.bountybench.constants import (
+    BOUNTYTASKS_DIR,
     SANDBOX_CODEBASE_DIR,
     SANDBOX_EXPLOIT_DIR,
 )
@@ -18,6 +22,7 @@ from concordia_evals.bountybench.data import (
     list_bounty_specs,
     record_to_sample,
 )
+from concordia_evals.bountybench.environment import _is_safe_member, tree_filter
 from concordia_evals.bountybench.prompts import (
     EXPLOIT_PROMPT,
     get_initial_prompt,
@@ -317,3 +322,104 @@ def test_format_huntr_writeup_renders_title_and_body() -> None:
 def test_sandbox_paths_match_the_upstream_layout() -> None:
     assert SANDBOX_EXPLOIT_DIR == "/app/exploit_files"
     assert SANDBOX_CODEBASE_DIR == "/app/codebase"
+
+
+def _tar_members(root: Path, **kwargs: Any) -> set[str]:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        tar.add(root, arcname=".", filter=tree_filter(**kwargs))
+    buffer.seek(0)
+    with tarfile.open(fileobj=buffer) as tar:
+        return {member.name for member in tar.getmembers()}
+
+
+def test_tree_filter_excludes_reference_solutions(tmp_path: Path) -> None:
+    """The reference exploit and patch never reach the agent's container."""
+    bounty = tmp_path / "bounties" / "bounty_0"
+    (bounty / "exploit_files").mkdir(parents=True)
+    (bounty / "exploit_files" / "exploit.sh").write_text("echo reference")
+    (bounty / "patch_files").mkdir()
+    (bounty / "patch_files" / "__init__.py").write_text("# fix")
+    (bounty / "verify_files").mkdir()
+    (bounty / "verify_files" / "verify.sh").write_text("exit 0")
+
+    members = _tar_members(
+        tmp_path,
+        exclude={"codebase"},
+        exclude_paths={
+            "bounties/bounty_0/exploit_files",
+            "bounties/bounty_0/patch_files",
+        },
+    )
+
+    assert "./bounties/bounty_0/verify_files/verify.sh" in members
+    assert not any("exploit_files" in member for member in members)
+    assert not any("patch_files" in member for member in members)
+
+
+def test_tree_filter_can_skip_hidden_files(tmp_path: Path) -> None:
+    """Hidden verify files are withheld from the agent (upstream default)."""
+    verify = tmp_path / "verify_files"
+    verify.mkdir()
+    (verify / "verify.sh").write_text("exit 0")
+    (verify / ".env_verify").write_text("SECRET=1")
+
+    visible = _tar_members(tmp_path)
+    hidden_skipped = _tar_members(tmp_path, skip_hidden=True)
+
+    assert "./verify_files/.env_verify" in visible
+    assert not any(".env_verify" in member for member in hidden_skipped)
+
+
+def _member(name: str, linkname: str = "") -> tarfile.TarInfo:
+    member = tarfile.TarInfo(name)
+    if linkname:
+        member.type = tarfile.SYMTYPE
+        member.linkname = linkname
+    return member
+
+
+def test_download_filter_rejects_escaping_archive_members(tmp_path: Path) -> None:
+    """Reject archive members that escape the target directory.
+
+    The sandbox produces the archive, so `..`, absolute paths and links out of
+    the target directory must be refused.
+    """
+    root = tmp_path.resolve()
+
+    assert _is_safe_member(root, _member("./exploit_files/exploit.sh"))
+    assert not _is_safe_member(root, _member("../etc/passwd"))
+    assert not _is_safe_member(root, _member("/etc/passwd"))
+    assert not _is_safe_member(root, _member("./exploit_files/link", "/etc/passwd"))
+    assert _is_safe_member(root, _member("./exploit_files/link", "../exploit.sh"))
+
+
+@pytest.mark.dataset_download
+def test_sandbox_mirror_hides_the_bounty_fixes() -> None:
+    """A plain clone of the upstream mirror exposes the fix commits.
+
+    The sandbox mirror must only carry the vulnerable commits of the system's
+    bounties, so that the agent cannot read the patch out of the git history.
+    """
+    root = data.ensure_bountytasks(BOUNTYTASKS_DIR)
+    spec = next(item for item in list_bounty_specs(root) if item.system == "zipp")
+    mirror = data.ensure_sandbox_mirror(spec)
+    source = data.ensure_codebase_mirror(spec)
+
+    upstream = _git(source, "log", "--all", "--oneline")
+    sandbox = _git(mirror, "log", "--all", "--oneline")
+    refs = _git(mirror, "for-each-ref", "--format=%(refname)")
+
+    # the fix of the zipp bounty is a later commit, only reachable from the pull
+    # request refs of the upstream mirror
+    assert "iterdir()` output order" in upstream
+    assert "iterdir()` output order" not in sandbox
+    assert "pull" not in refs
+    assert _git(mirror, "rev-parse", "--verify", spec.vulnerable_commit)
+
+
+def _git(directory: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=directory, capture_output=True, text=True, check=True
+    )
+    return result.stdout

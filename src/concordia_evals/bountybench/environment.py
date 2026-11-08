@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 from inspect_ai.util import ExecResult, SandboxEnvironment
 
@@ -377,24 +378,49 @@ async def sh(
     return await sbx.exec(["bash", "-lc", command], cwd=cwd, timeout=timeout)
 
 
-async def upload_tree(
-    sbx: SandboxEnvironment,
-    local_dir: Path,
-    remote_dir: str,
+def tree_filter(
     exclude: set[str] = set(),
+    exclude_paths: set[str] = set(),
     skip_hidden: bool = False,
-) -> None:
-    """Copy a host directory into the sandbox (tar piped through stdin)."""
+) -> Callable[[tarfile.TarInfo], tarfile.TarInfo | None]:
+    """Build the tar filter used to copy host trees into the sandbox.
+
+    `exclude` matches top level entries, `exclude_paths` matches relative
+    directories at any depth and `skip_hidden` drops any dot file.
+    """
 
     def _filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
         parts = Path(info.name).parts
         if parts and parts[0] in exclude:
             return None
+        relative = Path(*parts).as_posix() if parts else "."
+        if any(
+            relative == path or relative.startswith(f"{path}/")
+            for path in exclude_paths
+        ):
+            return None
         if skip_hidden and any(part.startswith(".") and part != "." for part in parts):
             return None
         return info
 
+    return _filter
+
+
+async def upload_tree(
+    sbx: SandboxEnvironment,
+    local_dir: Path,
+    remote_dir: str,
+    exclude: set[str] = set(),
+    exclude_paths: set[str] = set(),
+    skip_hidden: bool = False,
+) -> None:
+    """Copy a host directory into the sandbox (tar piped through stdin).
+
+    `exclude` matches top level entries, `exclude_paths` matches relative
+    directories at any depth.
+    """
     buffer = io.BytesIO()
+    _filter = tree_filter(exclude, exclude_paths, skip_hidden)
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         tar.add(local_dir, arcname=".", filter=_filter)
     payload = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -430,7 +456,23 @@ async def download_tree(
         if sys.version_info >= (3, 12):
             tar.extractall(path=local_dir, filter="data")
         else:  # pragma: no cover - Python < 3.12 has no extraction filters
+            root = local_dir.resolve()
+            for member in tar.getmembers():
+                if not _is_safe_member(root, member):
+                    raise RuntimeError(f"Refusing to extract {member.name}")
             tar.extractall(path=local_dir)
+
+
+def _is_safe_member(root: Path, member: tarfile.TarInfo) -> bool:
+    """Reject archive members that would escape `root` (`..`, absolute, links)."""
+    target = (root / member.name).resolve()
+    if not target.is_relative_to(root):
+        return False
+    if member.issym() or member.islnk():
+        link = (target.parent / member.linkname).resolve()
+        if not link.is_relative_to(root):
+            return False
+    return True
 
 
 async def run_script_in_sandbox(

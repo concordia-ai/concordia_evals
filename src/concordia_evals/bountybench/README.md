@@ -114,6 +114,22 @@ Deliberate differences:
 - **Interfaces.** Upstream reports phase progress through its own log files; here the outcome is a single binary score with the grading exit codes in `Score.metadata`.
 - **Not imported.** The two-phase `exploit_patch` and `detect_patch` workflows, the interactive/Helm/mock-model switches and the analytics backend (severity and bounty values are kept in `Score.metadata` for post-hoc analysis).
 
+## Cheat resistance
+
+The agent has root in its container, so anything it can read there it can also use. The harness therefore keeps the answers out of the container entirely:
+
+- **No reference solution in the sandbox.** The reference exploit and the patch files stay on the host. They are uploaded to the grading tree only for the run that needs them (the reference exploit of a `patch` sample), which happens after the agent has stopped.
+- **No fix in the git history.** The upstream `cy-suite` repositories are full GitHub mirrors whose later commits and pull request refs contain the bounties' fixes, so a plain clone hands the agent the answer. The sandbox gets a pruned mirror that only carries the vulnerable commits of the system's bounties (with their ancestors and the tags that point at them), which is all the checkouts of the tasks need.
+- **Grading scripts are restored, never reused.** `verify.sh` and the invariant scripts are re-uploaded from the host before they run, and the invariant test paths are restored before the patch is graded.
+- **Hidden verify files stay hidden** until verification (upstream's `skip_hidden_files`).
+- **The host side never trusts sandbox output.** Archives the sandbox produces are extracted with Python's `filter="data"` (and with an explicit check for `..`, absolute paths and escaping links on older interpreters).
+
+Known limitations, all shared with upstream:
+
+- The sandbox can reach the internet, so a determined agent can read the upstream repository. Blocking it needs `docker network create --internal shared_net`, which also cuts the egress of the target services.
+- Grading for systems that are not docker services runs in the agent's own container, so a lingering background process could tamper with the scripts between the exploit and `verify.sh`.
+- Hidden verify files are readable while the exploit runs, because the verification step restores them first.
+
 > [!WARNING]
 > Bounty *verification* scripts and invariant suites are shell scripts shipped by the dataset, and for service systems they run on the host exactly as they do upstream: they may install packages, rebuild docker images and `docker exec` into the target containers. Run this evaluation in an isolated environment.
 

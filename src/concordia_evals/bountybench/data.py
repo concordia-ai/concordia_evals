@@ -32,6 +32,7 @@ from concordia_evals.bountybench.constants import (
     DEFAULT_MEMORY_LIMIT,
     SANDBOX_COMPOSE_DIR,
     SANDBOX_MIRROR_DIR,
+    SANDBOX_MIRRORS_DIR,
     SHARED_NETWORK,
 )
 from concordia_evals.bountybench.prompts import get_initial_prompt
@@ -199,6 +200,125 @@ def ensure_codebase_mirror(
     return mirror
 
 
+def system_bounty_commits(spec: BountySpec) -> list[str]:
+    """Return the vulnerable commits of every bounty of the system."""
+    commits: list[str] = []
+    for metadata_file in sorted(
+        (spec.system_dir / "bounties").glob("*/bounty_metadata.json")
+    ):
+        commit = json.loads(metadata_file.read_text()).get("vulnerable_commit")
+        if commit and commit not in commits:
+            commits.append(commit)
+    if spec.vulnerable_commit not in commits:
+        commits.insert(0, spec.vulnerable_commit)
+    return commits
+
+
+def ensure_sandbox_mirror(
+    spec: BountySpec, cache_dir: Path = SANDBOX_MIRRORS_DIR
+) -> Path:
+    """Build the codebase mirror that is mounted into the agent sandbox.
+
+    The upstream repositories are full GitHub mirrors: their later commits and
+    pull request refs contain the fixes for the bounties, so a plain clone would
+    hand the answer to the agent. The sandbox mirror keeps only the vulnerable
+    commits of the system's bounties (with their ancestors and the tags that
+    point at them), which is all the checkouts of the tasks need.
+    """
+    commits = system_bounty_commits(spec)
+    mirror = cache_dir / f"{spec.system}.git"
+    ready = mirror / ".commits"
+    if ready.exists() and ready.read_text().split() == commits:
+        return mirror
+
+    source = ensure_codebase_mirror(spec)
+    missing = _missing_commits(source, commits)
+    if missing:
+        logger.info(f"Fetching {len(missing)} commits of {spec.system} into the cache")
+        _run_git(["fetch", "--quiet", "--tags", "origin"], cwd=source)
+
+    shutil.rmtree(mirror, ignore_errors=True)
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    _run_git(["init", "--bare", "--quiet", str(mirror)])
+    tags = _reachable_tags(source, commits)
+    for index, commit in enumerate(commits):
+        # Fetch into a neutral namespace first: commits are referenced by tag
+        # name in some tasks and a tag object cannot be written to a branch.
+        staging = f"refs/bb/{index}"
+        _run_git(
+            ["fetch", "--quiet", "--no-tags", str(source), f"{commit}:{staging}"],
+            cwd=mirror,
+        )
+        branch = f"refs/heads/bb-{index}"
+        _run_git(
+            ["update-ref", branch, _rev_parse(mirror, f"{staging}^{{commit}}")],
+            cwd=mirror,
+        )
+        _run_git(["update-ref", "-d", staging], cwd=mirror)
+        if index == 0:
+            _run_git(["symbolic-ref", "HEAD", branch], cwd=mirror)
+    for tag in tags:
+        _run_git(
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                str(source),
+                f"refs/tags/{tag}:refs/tags/{tag}",
+            ],
+            cwd=mirror,
+        )
+    # The vulnerable commits are referenced by name in some tasks (`v3.19.0`).
+    for commit in commits:
+        _run_git(["rev-parse", "--verify", f"{commit}^{{commit}}"], cwd=mirror)
+    ready.write_text("\n".join(commits) + "\n")
+    return mirror
+
+
+def _rev_parse(mirror: Path, rev: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", rev],
+        cwd=mirror,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git rev-parse {rev} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _missing_commits(mirror: Path, commits: list[str]) -> list[str]:
+    missing: list[str] = []
+    for commit in commits:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            cwd=mirror,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            missing.append(commit)
+    return missing
+
+
+def _reachable_tags(mirror: Path, commits: list[str]) -> list[str]:
+    """Tags that point at one of `commits` or at one of its ancestors."""
+    tags: set[str] = set()
+    for commit in commits:
+        result = subprocess.run(
+            ["git", "tag", "--merged", commit],
+            cwd=mirror,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            tags.update(result.stdout.split())
+    return sorted(tags)
+
+
 def _codebase_org() -> str:
     from concordia_evals.bountybench.constants import CODEBASE_REPO_ORG
 
@@ -218,7 +338,7 @@ def sandbox_compose_file(
 ) -> Path:
     """Write (once per system) the compose file for the agent sandbox."""
     compose_path = cache_dir / f"{spec.system}.yaml"
-    mirror = ensure_codebase_mirror(spec)
+    mirror = ensure_sandbox_mirror(spec)
     if compose_path.exists() and mirror.as_posix() in compose_path.read_text():
         return compose_path
 

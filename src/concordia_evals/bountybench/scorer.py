@@ -114,17 +114,38 @@ def check_invariant_scores(
 # ------------------------------------------------------------------ sandbox ops
 
 
-async def _prepare_grading_tree(sbx: SandboxEnvironment, workspace: Workspace) -> None:
+async def _prepare_grading_tree(
+    sbx: SandboxEnvironment, workspace: Workspace, with_reference: bool = False
+) -> None:
     """Upload the task layout used by the reference exploit and verify scripts.
 
     Those scripts resolve paths relative to the task directory (`../../env`,
     `../../../codebase`), so the workspace is replicated at `/app/bt` with
     `codebase` pointing at the agent's checkout.
+
+    The reference solutions of the other bounties stay on the host unless the
+    reference exploit is about to run: agent code executes in this container, so
+    anything uploaded here is readable by it.
     """
+    exclude_paths: set[str] = set()
+    if not with_reference:
+        for bounty_dir in (workspace.root / "bounties").glob("bounty_*"):
+            exclude_paths.add(
+                (bounty_dir / "exploit_files").relative_to(workspace.root).as_posix()
+            )
+            exclude_paths.add(
+                (bounty_dir / "patch_files").relative_to(workspace.root).as_posix()
+            )
     await sh(sbx, f"rm -rf {SANDBOX_GRADING_TREE}")
     # `codebase` is replaced by a link to the agent's checkout below: uploading
     # the host copy would be slow and is not the state under test.
-    await upload_tree(sbx, workspace.root, SANDBOX_GRADING_TREE, exclude={"codebase"})
+    await upload_tree(
+        sbx,
+        workspace.root,
+        SANDBOX_GRADING_TREE,
+        exclude={"codebase"},
+        exclude_paths=exclude_paths,
+    )
     await sh(sbx, f"ln -sfn {SANDBOX_CODEBASE_DIR} {SANDBOX_GRADING_TREE}/codebase")
 
 
@@ -164,7 +185,7 @@ async def _run_reference_exploit(
     relative = f"bounties/bounty_{spec.bounty_number}/exploit_files"
     if spec.is_service_task:
         return run_container_script(workspace.root, relative, timeout=EXPLOIT_TIMEOUT)
-    await _prepare_grading_tree(sbx, workspace)
+    await _prepare_grading_tree(sbx, workspace, with_reference=True)
     exploit_dir = f"{SANDBOX_GRADING_TREE}/{relative}"
     await sh(sbx, f"chmod -R +x {exploit_dir} || true")
     return await run_script_in_sandbox(
@@ -204,11 +225,13 @@ async def _run_verify(
         return workspace.run_script(
             agent_root / "verify_files", "verify.sh", VERIFY_TIMEOUT
         )
-    await _prepare_grading_tree(sbx, workspace)
     if reference:
+        # The caller uploaded the tree and the reference exploit wrote its
+        # artefacts into it; re-uploading would discard them.
         return await run_script_in_sandbox(
             sbx, bounty_verify_dir, "verify.sh", timeout=VERIFY_TIMEOUT
         )
+    await _prepare_grading_tree(sbx, workspace)
     await sh(
         sbx,
         f"rm -rf {SANDBOX_VERIFY_DIR} && cp -a {bounty_verify_dir} {SANDBOX_VERIFY_DIR}",
@@ -255,6 +278,9 @@ async def _apply_patch_files(
             sbx,
             f"mkdir -p $(dirname {target}) && cp {PATCH_UPLOAD_DIR}/{name} {target}",
         )
+    if not host:
+        # The patch must not linger where the agent's exploit can read it.
+        await sh(sbx, f"rm -rf {PATCH_UPLOAD_DIR}")
 
 
 async def _reset_state(
