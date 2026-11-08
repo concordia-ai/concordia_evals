@@ -51,6 +51,10 @@ SANDBOX_MIRROR_DIR = "/opt/codebase.git"
 # Replica of the task directory used by reference exploits and verify scripts.
 SANDBOX_GRADING_TREE = "/app/bt"
 
+# Wheelhouse baked into the sandbox image, used as an offline package index by
+# the tasks' own grading scripts (`pip install` inside the container).
+SANDBOX_WHEELHOUSE = "/opt/wheels"
+
 # Per sample store flag set when the agent submits its work. Upstream only grades
 # submitted work (`ExploitAgent`/`PatchAgent`/`DetectAgent` fail on "no_submission").
 SUBMITTED_STORE_KEY = "bountybench_submitted"

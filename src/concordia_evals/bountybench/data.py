@@ -32,6 +32,7 @@ from concordia_evals.bountybench.constants import (
     SANDBOX_COMPOSE_DIR,
     SANDBOX_MIRROR_DIR,
     SANDBOX_MIRRORS_DIR,
+    SANDBOX_WHEELHOUSE,
     SHARED_NETWORK,
 )
 from concordia_evals.bountybench.prompts import get_initial_prompt
@@ -355,6 +356,12 @@ def sandbox_compose_file(
     init: true
     command: ["tail", "-f", "/dev/null"]
     working_dir: /app
+    environment:
+      # offline package index baked into the image: the tasks' own grading
+      # scripts install their test dependencies from it
+      PIP_NO_INDEX: "1"
+      PIP_FIND_LINKS: {SANDBOX_WHEELHOUSE}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
     cpus: "{DEFAULT_CPU_LIMIT}"
     mem_limit: {DEFAULT_MEMORY_LIMIT}
     volumes:

@@ -15,9 +15,11 @@ This module keeps that layout:
 
 import atexit
 import base64
+import hashlib
 import io
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +45,7 @@ from concordia_evals.bountybench.constants import (
     SANDBOX_EXPLOIT_DIR,
     SANDBOX_MIRROR_DIR,
     SANDBOX_VERIFY_DIR,
+    SANDBOX_WHEELHOUSE,
     SHARED_NETWORK,
     WORKSPACES_DIR,
 )
@@ -113,36 +116,6 @@ def ensure_shared_network(name: str = SHARED_NETWORK) -> None:
         raise RuntimeError(f"Unable to create docker network {name}")
 
 
-# Default docker bridge: the only way to the internet used by this evaluation.
-EGRESS_NETWORK = "bridge"
-
-
-async def set_sandbox_egress(sbx: SandboxEnvironment, enabled: bool) -> None:
-    """Attach or detach the sandbox to the egress network.
-
-    The sandbox is only attached to the internal shared network, so it has no
-    internet access while the agent works. The dataset's grading scripts install
-    their own dependencies, so they are run inside such a window.
-    """
-    hostname = await sh(sbx, "hostname")
-    container = hostname.stdout.strip()
-    if not container:
-        logger.warning("Unable to resolve the sandbox container for network access")
-        return
-    action = "connect" if enabled else "disconnect"
-    args = ["docker", "network", action, EGRESS_NETWORK, container]
-    if not enabled:
-        args.insert(3, "-f")
-    result = run_host(args)
-    # `connect` fails when the container is already attached and `disconnect`
-    # when it is not, which is the state we want in both cases.
-    expected = ["already exists", "is not connected"]
-    if result.returncode != 0 and not any(m in result.stderr for m in expected):
-        logger.warning(
-            "docker network %s %s failed: %s", action, EGRESS_NETWORK, result.stderr
-        )
-
-
 def image_exists(tag: str) -> bool:
     return run_host(["docker", "image", "inspect", tag]).returncode == 0
 
@@ -193,6 +166,158 @@ def install_script(
     return install_command or "make install"
 
 
+# Packages the grading scripts need on top of what they ask for: pip itself (the
+# scripts run `pip install --upgrade pip`) and the build backends of the
+# repositories they install with `pip install ./codebase`.
+WHEELHOUSE_BASELINE = (
+    "pip",
+    "setuptools",
+    "setuptools_scm",
+    "wheel",
+    "packaging",
+    "hatchling",
+    "hatch-vcs",
+    "flit-core",
+    "poetry-core",
+    "pdm-backend",
+    "cython",
+)
+
+GRADING_SCRIPTS = (
+    ("run_repo_invariants.sh",),
+    ("run_bounty_invariants.sh",),
+    ("verify_files", "verify.sh"),
+    ("verify.sh",),
+)
+
+_PIP_INSTALL = re.compile(
+    r"^\s*(?:sudo\s+)?(?:python[0-9.]*\s+-m\s+)?pip[0-9.]*\s+install\s+(.*)$"
+)
+_PIP_FLAGS_WITH_VALUE = {
+    "-r",
+    "--requirement",
+    "-c",
+    "--constraint",
+    "-i",
+    "--index-url",
+    "--extra-index-url",
+    "-f",
+    "--find-links",
+    "--platform",
+    "--python-version",
+    "--only-binary",
+    "--no-binary",
+    "--target",
+    "--prefix",
+    "--cache-dir",
+    "--progress-bar",
+}
+_PIP_FLAGS_WITHOUT_VALUE = {
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "-U",
+    "--upgrade",
+    "-e",
+    "--editable",
+    "--force-reinstall",
+    "--no-build-isolation",
+    "--prefer-binary",
+    "--no-cache-dir",
+    "--user",
+    "--no-deps",
+}
+
+
+def grading_requirements(spec: BountySpec) -> tuple[list[str], list[str]]:
+    """Collect what the grading scripts of a sample install with pip.
+
+    Returns the PyPI requirements and the local paths (`./codebase`, `.[dev]`)
+    the scripts install, so that both can be fetched while building the image.
+    """
+    requirements: set[str] = set()
+    local: set[str] = set()
+    for parts in GRADING_SCRIPTS:
+        script = (
+            spec.bounty_dir.joinpath(*parts)
+            if parts[0] != "run_repo_invariants.sh"
+            else spec.system_dir.joinpath(*parts)
+        )
+        if not script.exists():
+            continue
+        text = script.read_text(errors="replace").replace("\\\n", " ")
+        for line in text.splitlines():
+            match = _PIP_INSTALL.match(line)
+            if not match or line.lstrip().startswith("#"):
+                continue
+            tokens = shlex.split(match.group(1), comments=True)
+            index = 0
+            while index < len(tokens):
+                token = tokens[index]
+                index += 1
+                if token in _PIP_FLAGS_WITH_VALUE:
+                    index += 1
+                    continue
+                if token in _PIP_FLAGS_WITHOUT_VALUE or token.startswith("-"):
+                    continue
+                if token.startswith((".", "/", "~")) or token.endswith(".txt"):
+                    local.add(token)
+                else:
+                    requirements.add(token)
+    return sorted(requirements), sorted(local)
+
+
+def codebase_relative(path: str) -> str:
+    """Map a path the script installs to its location in the image checkout.
+
+    The scripts run from the task directory, where the repository is
+    `./codebase`; inside the image that directory is the build mount itself.
+    """
+    for prefix in ("./codebase", "codebase"):
+        if path == prefix:
+            return "."
+        if path.startswith(f"{prefix}/"):
+            return f"./{path[len(prefix) + 1 :]}"
+    return path if path.startswith((".", "/")) else f"./{path}"
+
+
+def wheelhouse_script(requirements: list[str], local: list[str]) -> str:
+    """Script that fills `/opt/wheels` while the image is built.
+
+    Each requirement is resolved on its own so that unrelated scripts cannot
+    conflict, and a package that cannot be fetched is reported instead of
+    failing the build.
+    """
+    lines = ["#!/bin/bash", "set -o pipefail", f"mkdir -p {SANDBOX_WHEELHOUSE}"]
+    baseline = " ".join(WHEELHOUSE_BASELINE)
+    lines.append(f"pip download -q -d {SANDBOX_WHEELHOUSE} {baseline} || true")
+    for requirement in requirements:
+        if requirement.lower() in {name.lower() for name in WHEELHOUSE_BASELINE}:
+            continue
+        lines.append(
+            f"pip download -q -d {SANDBOX_WHEELHOUSE} {shlex.quote(requirement)} "
+            f'|| echo "MISSING {requirement}"'
+        )
+    for path in local:
+        target = codebase_relative(path)
+        lines.append(
+            f"(cd {SANDBOX_CODEBASE_DIR} && pip download -q -d {SANDBOX_WHEELHOUSE} "
+            f'{shlex.quote(target)}) || echo "MISSING {path}"'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _image_is_current(context: Path) -> bool:
+    """Whether the image of `context` was built from the current recipe."""
+    stamp = context / "image.stamp"
+    dockerfile = context / AGENT_DOCKERFILE
+    if not stamp.exists() or not dockerfile.exists():
+        return False
+    digest = hashlib.sha256(dockerfile.read_text().encode()).hexdigest()
+    return stamp.read_text().strip() == digest
+
+
 def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -> str:
     """Build (once) the sandbox image of a sample, with the repository installed.
 
@@ -214,18 +339,31 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
         return AGENT_IMAGE
 
     tag = sample_image_tag(spec)
-    if image_exists(tag):
+    if image_exists(tag) and _image_is_current(context):
         return tag
 
     ensure_agent_image()
     context.mkdir(parents=True, exist_ok=True)
+    # The grading scripts of a service system run on the host, so only samples
+    # that are graded inside the sandbox need the offline package index.
+    wheelhouse = ""
+    if not spec.is_service_task:
+        requirements, local = grading_requirements(spec)
+        (context / "wheelhouse.sh").write_text(wheelhouse_script(requirements, local))
+        wheelhouse = f"""# offline package index for the grading scripts of this sample
+COPY wheelhouse.sh /tmp/wheelhouse.sh
+RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
+    bash /tmp/wheelhouse.sh
+"""
     dockerfile = context / AGENT_DOCKERFILE
-    dockerfile.write_text(
-        f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
+    body = f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
 FROM {AGENT_IMAGE}
 RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
     cd {SANDBOX_CODEBASE_DIR} && {command}
-"""
+{wheelhouse}"""
+    dockerfile.write_text(body)
+    (context / "image.stamp").write_text(
+        hashlib.sha256(body.encode()).hexdigest() + "\n"
     )
     logger.info(f"Building the sandbox image {tag} ({spec.sample_id})")
     built = run_host(

@@ -24,8 +24,11 @@ from concordia_evals.bountybench.data import (
 )
 from concordia_evals.bountybench.environment import (
     _is_safe_member,
+    codebase_relative,
+    grading_requirements,
     install_script,
     tree_filter,
+    wheelhouse_script,
 )
 from concordia_evals.bountybench.prompts import (
     EXPLOIT_PROMPT,
@@ -450,3 +453,57 @@ def test_install_script_matches_the_upstream_install(tmp_path: Path) -> None:
     assert install_script(c_repo, "make -C . install", None) == "make -C . install"
     assert install_script(python_repo, None, True) == "pip install -e ."
     assert install_script(python_repo, None, False) is None
+
+
+def test_grading_requirements_are_taken_from_the_task_scripts(tmp_path: Path) -> None:
+    """The grading scripts' pip installs are pre-fetched while building the image."""
+    root = _make_bounty_tasks_tree(tmp_path)
+    spec = _spec(root)
+    (spec.system_dir / "run_repo_invariants.sh").write_text(
+        "#!/bin/bash\n"
+        "pip install --upgrade pip\n"
+        "pip install -q ./codebase\n"
+        "pip install -q pytest pytest-mock -r requirements-test.txt\n"
+        "pip install -e '.[test]' --no-build-isolation\n"
+        "## pip install commented-out-package\n"
+        "pip install pandas \\\n"
+        "    numpy<2\n"
+    )
+    (spec.bounty_dir / "verify_files" / "verify.sh").write_text(
+        "#!/bin/bash\npip install psycopg2-binary\n"
+    )
+
+    requirements, local = grading_requirements(spec)
+
+    # `pip` itself is collected as well: the scripts run `pip install --upgrade pip`
+    assert requirements == [
+        "numpy<2",
+        "pandas",
+        "pip",
+        "psycopg2-binary",
+        "pytest",
+        "pytest-mock",
+    ]
+    assert "./codebase" in local
+    assert ".[test]" in local
+    assert "commented-out-package" not in requirements
+
+
+def test_wheelhouse_script_downloads_every_requirement(tmp_path: Path) -> None:
+    script = wheelhouse_script(["pytest", "numpy<2"], ["./codebase", "libs/core"])
+
+    assert "pip download -q -d /opt/wheels pytest" in script
+    assert "'numpy<2'" in script
+    # the scripts run from the task directory, the image checkout is the mount
+    assert "(cd /app/codebase && pip download -q -d /opt/wheels .)" in script
+    assert "(cd /app/codebase && pip download -q -d /opt/wheels ./libs/core)" in script
+    assert "MISSING" in script
+    assert "setuptools_scm" in script
+
+
+def test_codebase_relative_maps_paths_into_the_checkout() -> None:
+    assert codebase_relative("./codebase") == "."
+    assert codebase_relative("codebase") == "."
+    assert codebase_relative("./codebase/libs/app") == "./libs/app"
+    assert codebase_relative(".[dev]") == ".[dev]"
+    assert codebase_relative("libs/langchain") == "./libs/langchain"

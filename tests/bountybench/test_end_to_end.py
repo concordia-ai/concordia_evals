@@ -85,6 +85,16 @@ def offline_sandbox_solver() -> Solver:
             ]
         )
         assert not online.success, f"sandbox reached the internet: {online.stdout}"
+        # the grading scripts install their dependencies from the baked wheelhouse
+        offline_install = await sbx.exec(
+            [
+                "bash",
+                "-lc",
+                "python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q pytest "
+                "&& /tmp/venv/bin/python -c 'import pytest; print(pytest.__version__)'",
+            ]
+        )
+        assert offline_install.success, offline_install.stderr
         store().set(SUBMITTED_STORE_KEY, True)
         return state
 
