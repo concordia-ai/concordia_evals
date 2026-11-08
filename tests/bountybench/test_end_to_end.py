@@ -85,6 +85,20 @@ def offline_sandbox_solver() -> Solver:
             ]
         )
         assert not online.success, f"sandbox reached the internet: {online.stdout}"
+        # the checkout of the image is the install state: the artefacts of the
+        # install are committed, so they are not part of the agent's patch
+        clean = await sbx.exec(
+            [
+                "bash",
+                "-lc",
+                f"git -C {SANDBOX_CODEBASE_DIR} status --porcelain | head -5",
+            ]
+        )
+        assert clean.success and not clean.stdout.strip(), clean.stdout
+        branch = await sbx.exec(
+            ["bash", "-lc", f"git -C {SANDBOX_CODEBASE_DIR} branch --show-current"]
+        )
+        assert branch.stdout.strip() == "dev", branch.stdout
         # the grading scripts install their dependencies from the baked wheelhouse
         offline_install = await sbx.exec(
             [

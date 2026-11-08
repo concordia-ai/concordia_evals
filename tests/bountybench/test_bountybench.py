@@ -27,6 +27,7 @@ from concordia_evals.bountybench.environment import (
     codebase_relative,
     grading_requirements,
     install_script,
+    sample_recipe,
     tree_filter,
     wheelhouse_script,
 )
@@ -287,10 +288,6 @@ def test_record_to_sample_builds_prompt_metadata_and_sandbox(
     spec = _spec(_make_bounty_tasks_tree(tmp_path))
     compose = tmp_path / "compose.yaml"
     compose.write_text("services: {}\n")
-    mirror = tmp_path / "mirror.git"
-    monkeypatch.setattr(
-        data, "ensure_codebase_mirror", lambda spec, cache_dir=None: mirror
-    )
     monkeypatch.setattr(
         data, "sandbox_compose_file", lambda spec, image=None, cache_dir=None: compose
     )
@@ -308,7 +305,7 @@ def test_record_to_sample_builds_prompt_metadata_and_sandbox(
     assert metadata["task_type"] == "exploit"
     assert metadata["vulnerable_commit"] == "abc123"
     assert metadata["compatible_bounties"] == ["0"]
-    assert metadata["codebase_mirror"] == str(mirror)
+    assert "codebase_mirror" not in metadata
 
 
 def test_format_huntr_writeup_renders_title_and_body() -> None:
@@ -507,3 +504,73 @@ def test_codebase_relative_maps_paths_into_the_checkout() -> None:
     assert codebase_relative("./codebase/libs/app") == "./libs/app"
     assert codebase_relative(".[dev]") == ".[dev]"
     assert codebase_relative("libs/langchain") == "./libs/langchain"
+
+
+def _local_spec(tmp_path: Path) -> BountySpec:
+    """A spec of a system that is not started as docker compose services."""
+    root = _make_bounty_tasks_tree(tmp_path)
+    metadata_path = root / "demoapp" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("target_host")
+    metadata_path.write_text(json.dumps(metadata))
+    return _spec(root)
+
+
+def test_sample_recipe_bakes_the_checkout_into_local_task_images(
+    tmp_path: Path,
+) -> None:
+    """Local tasks are graded inside the sandbox: their image holds the code."""
+    spec = _local_spec(tmp_path)
+
+    recipe = sample_recipe(spec, "pip install -e .", "#!/bin/bash\n")
+
+    assert f"COPY codebase {SANDBOX_CODEBASE_DIR}" in recipe
+    assert f"RUN cd {SANDBOX_CODEBASE_DIR} && pip install -e ." in recipe
+    # the install artefacts belong to the starting state, not to the patch
+    assert "commit --quiet --allow-empty -m 'Install the codebase'" in recipe
+    assert "git checkout --quiet -B dev" in recipe
+    assert "COPY wheelhouse.sh /tmp/wheelhouse.sh" in recipe
+
+
+def test_sample_recipe_only_mounts_the_checkout_for_service_tasks(
+    tmp_path: Path,
+) -> None:
+    """Service tasks run their code in the stack: the image stays small."""
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    recipe = sample_recipe(spec, "pip install -e .", None)
+
+    assert "COPY codebase" not in recipe
+    assert f"--mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR}" in recipe
+    assert "wheelhouse.sh" not in recipe
+
+
+def test_sample_recipe_skips_the_install_when_there_is_none(tmp_path: Path) -> None:
+    spec = _local_spec(tmp_path)
+
+    recipe = sample_recipe(spec, None, None)
+
+    assert "pip install" not in recipe
+    assert f"COPY codebase {SANDBOX_CODEBASE_DIR}" in recipe
+
+
+def test_sandbox_compose_file_mounts_the_mirror_only_for_service_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mirror = tmp_path / "mirror.git"
+    monkeypatch.setattr(
+        data, "ensure_sandbox_mirror", lambda spec, cache_dir=None: mirror
+    )
+    local = _local_spec(tmp_path / "local")
+    service = _spec(_make_bounty_tasks_tree(tmp_path / "service"))
+
+    # separate caches: both specs would share the same compose file name
+    local_compose = data.sandbox_compose_file(
+        local, cache_dir=tmp_path / "local_compose"
+    )
+    service_compose = data.sandbox_compose_file(
+        service, cache_dir=tmp_path / "service_compose"
+    )
+
+    assert "volumes" not in local_compose.read_text()
+    assert f"{mirror}:{'/opt/codebase.git'}:ro" in service_compose.read_text()

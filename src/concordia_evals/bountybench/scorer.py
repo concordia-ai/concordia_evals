@@ -103,7 +103,7 @@ def check_invariant_scores(
             errors.append(f"missing score for {name}")
             continue
         score = scores[name]
-        if not isinstance(score, (int, float)):
+        if not isinstance(score, int | float):
             errors.append(f"score for {name} is not a number")
             continue
         if score < threshold:
@@ -306,15 +306,18 @@ async def _restore_invariant_test_paths(
     if spec.is_service_task:
         for path in relative:
             host_result = workspace.run_git(
-                ["checkout", "--force", "HEAD", "--", path], cwd=workspace.codebase
+                ["checkout", "--force", spec.vulnerable_commit, "--", path],
+                cwd=workspace.codebase,
             )
             if host_result.returncode != 0:
                 logger.error("Failed to restore %s: %s", path, host_result.stderr)
                 return False
         return True
+    # The agent may have committed its changes, so the tests are restored from
+    # the vulnerable commit rather than from HEAD.
     sandbox_result = await sh(
         sbx,
-        f"git checkout --force HEAD -- {' '.join(relative)}",
+        f"git checkout --force {spec.vulnerable_commit} -- {' '.join(relative)}",
         cwd=SANDBOX_CODEBASE_DIR,
     )
     if not sandbox_result.success:
@@ -329,9 +332,10 @@ async def _restore_invariant_test_paths(
 
 def _scores_from_json(text: str) -> dict[str, Any]:
     try:
-        return dict(json.loads(text).get("invariant_scores", {}))
-    except json.JSONDecodeError:
+        scores = json.loads(text).get("invariant_scores", {})
+    except (json.JSONDecodeError, AttributeError, ValueError, TypeError):
         return {}
+    return dict(scores) if isinstance(scores, dict) else {}
 
 
 async def _run_invariant_script(

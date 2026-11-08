@@ -14,9 +14,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from inspect_ai.dataset import Dataset, MemoryDataset, Sample
 from inspect_ai.util import SandboxEnvironmentSpec
@@ -190,12 +191,14 @@ def ensure_codebase_mirror(
     source for the per-sample checkouts used when building/running the target.
     """
     mirror = cache_dir / f"{spec.system}.git"
-    if mirror.exists():
+    ready = mirror / "HEAD"
+    if ready.exists():
         return mirror
 
     url = f"https://github.com/{_codebase_org()}/{spec.system}.git"
     mirror.parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Cloning target codebase {url}")
+    shutil.rmtree(mirror, ignore_errors=True)
     _run_git(["clone", "--mirror", url, str(mirror)])
     return mirror
 
@@ -340,12 +343,19 @@ def sandbox_compose_file(
 ) -> Path:
     """Write (once per sample) the compose file for the agent sandbox.
 
-    The sandbox image has the target repository installed at build time, runs on
-    the internal shared network only and gets the pruned codebase mirror, so the
-    agent needs no network access at run time.
+    The sandbox runs on the internal shared network only (so the agent needs no
+    network access at run time) and its image has the target repository
+    installed at build time, plus the pruned codebase mirror for service tasks.
     """
     compose_path = cache_dir / f"{spec.system}_bounty_{spec.bounty_number}.yaml"
-    mirror = ensure_sandbox_mirror(spec)
+    # Service tasks clone their codebase from the pruned mirror at run time; the
+    # image of a local task already carries the checkout.
+    volumes = ""
+    if spec.is_service_task:
+        mirror = ensure_sandbox_mirror(spec)
+        volumes = f"""    volumes:
+      - {mirror.as_posix()}:{SANDBOX_MIRROR_DIR}:ro
+"""
     compose_path.parent.mkdir(parents=True, exist_ok=True)
     compose_path.write_text(
         f"""services:
@@ -364,9 +374,7 @@ def sandbox_compose_file(
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     cpus: "{DEFAULT_CPU_LIMIT}"
     mem_limit: {DEFAULT_MEMORY_LIMIT}
-    volumes:
-      - {mirror.as_posix()}:{SANDBOX_MIRROR_DIR}:ro
-    networks:
+{volumes}    networks:
       - {SHARED_NETWORK}
 
 networks:
@@ -413,7 +421,6 @@ def record_to_sample(
         "compatible_bounties": compatible_bounties(spec.bounty_metadata),
         "bountytasks_system_dir": str(spec.system_dir),
         "bountytasks_bounty_dir": str(spec.bounty_dir),
-        "codebase_mirror": str(ensure_codebase_mirror(spec)),
     }
     return Sample(
         id=spec.sample_id,
