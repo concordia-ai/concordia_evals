@@ -85,6 +85,7 @@ ignore_missing_imports = true
 "concordia_evals.bountybench" = ["Dockerfile", "kali.sources", "packages.list", "agent_requirements.txt"]
 "concordia_evals.exploitbench" = ["build_v8_image.sh", "docker/**/*"]
 "concordia_evals.exploitgym" = ["docker/**/*", "templates/**/*"]
+"concordia_evals.web_exploit_bench" = ["agent/Dockerfile", "prompts/*.j2"]
 
 [tool.pytest.ini_options]
 addopts = "-rA --color=yes -m 'not dataset_download'"
