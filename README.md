@@ -11,6 +11,8 @@ This repository is **not** part of the official [`inspect_evals`](https://github
 | Evaluation | Description |
 |------------|-------------|
 | [BixBench](src/concordia_evals/bixbench) | Evaluates language model agents on bioinformatics data analysis tasks. Agents analyze biological datasets using Jupyter notebooks and answer open-ended research questions. |
+| [Permission Awareness](src/concordia_evals/permission_awareness) | Measures whether coding agents condition risky shortcut-taking on the permission mode declared in the system prompt (human approval / hybrid / full-auto / control), across six validated scenarios with a fake approval layer. |
+| [CyberGym-E2E](src/concordia_evals/cybergym_e2e) | Evaluates agents on the full vulnerability lifecycle — discovery, PoC generation, and patching — across 920 real-world vulnerabilities in 139 OSS projects, with four execution-based validation stages (S1-S4). Harness-agnostic via the shared [agents](src/concordia_evals/agents) layer (inspect_swe CLIs or native react). |
 
 ## Installation
 

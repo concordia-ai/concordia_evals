@@ -19,11 +19,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "inspect_ai >= 0.3.221",
+    "inspect-ai>=0.3.261",
     "datasets >= 4.8.5",
     "huggingface-hub >= 1.2.0",
     "docker",
     "platformdirs",
+    "openai>=3.4",
+    "inspect-swe>=0.2.72",
+    "tomli>=2.4.1 ; python_full_version < '3.11'",
+    "agent-client-protocol>=0.12.0,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +52,8 @@ where = ["src"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# Vendored third-party files stay byte-identical to upstream.
+exclude = ["src/concordia_evals/cybergym_e2e/vendor"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "D", "NPY", "PLE", "PLR", "PLW"]
@@ -77,6 +83,15 @@ ignore_missing_imports = true
 module = ["datasets", "datasets.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["tomli", "tomli.*"]
+ignore_missing_imports = true
+
+# Vendored upstream file: byte-identical copy, not type-checked.
+[[tool.mypy.overrides]]
+module = ["concordia_evals.cybergym_e2e.vendor.validate"]
+ignore_errors = true
+
 [tool.setuptools.package-data]
 "concordia_evals.bixbench" = ["Dockerfile"]
 
@@ -84,4 +99,5 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 markers = [
     "dataset_download: tests that download datasets",
+    "docker_smoke: end-to-end pipeline smoke tests requiring docker (slow)",
 ]
