@@ -12,6 +12,7 @@ This repository is **not** part of the official [`inspect_evals`](https://github
 |------------|-------------|
 | [BixBench](src/concordia_evals/bixbench) | Evaluates language model agents on bioinformatics data analysis tasks. Agents analyze biological datasets using Jupyter notebooks and answer open-ended research questions. |
 | [BountyBench](src/concordia_evals/bountybench) | Evaluates agents on 46 real-world bug bounties across 31 open source systems in three task types: `detect`, `exploit` and `patch`. Each system runs as a docker compose stack next to a Kali agent container. |
+| [ExploitBench](src/concordia_evals/exploitbench) | Measures how far agents climb the real-world exploitation ladder on patched-then-disclosed Chromium V8 vulnerabilities, from reaching the patched code to arbitrary code execution, scored as a capability bitmap. |
 
 ## Installation
 

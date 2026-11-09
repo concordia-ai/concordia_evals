@@ -81,6 +81,7 @@ ignore_missing_imports = true
 [tool.setuptools.package-data]
 "concordia_evals.bixbench" = ["Dockerfile"]
 "concordia_evals.bountybench" = ["Dockerfile", "kali.sources", "packages.list", "agent_requirements.txt"]
+"concordia_evals.exploitbench" = ["build_v8_image.sh", "docker/**/*"]
 
 [tool.pytest.ini_options]
 addopts = "-rA --color=yes -m 'not dataset_download'"
