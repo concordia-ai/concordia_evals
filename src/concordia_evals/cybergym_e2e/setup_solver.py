@@ -86,6 +86,18 @@ def setup_workspace() -> Solver:
         validate_py = (VENDOR_DIR / "validate.py").read_bytes()
         await sandbox().write_file("/scripts/validate.py", validate_py)
 
+        # Same documented, opt-in deviation as validation.py: raise the
+        # compile timeout on the deployed copy so the agent's own iterative
+        # self-tests get the same compile budget as the scoring containers.
+        compile_timeout = state.metadata.get("validation_compile_timeout")
+        if compile_timeout is not None:
+            await _exec(
+                f"sed -i 's/timeout=3600/timeout={compile_timeout}/g' /scripts/validate.py && "
+                "test \"$(grep -c 'timeout=3600' /scripts/validate.py)\" = '0'",
+                "adjust agent-side validate.py compile timeout",
+                timeout=60,
+            )
+
         await _exec(
             "cp /task_data/src.tgz /src/src.tgz && tar xf /src/src.tgz -C /src && rm /src/src.tgz",
             "extract source",

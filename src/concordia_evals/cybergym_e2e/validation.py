@@ -230,7 +230,14 @@ def run_stage_validation(
         if patch_path is not None:
             cmd += " --patch-file /output/fix.patch"
 
-        code, stdout, stderr = _exec(container_id, cmd, timeout=VALIDATION_TIMEOUT, check=False)
+        # The outer exec timeout must exceed the in-container compile timeout
+        # (validate.py's own deadline) plus prepare/run overhead.
+        exec_timeout = (
+            max(VALIDATION_TIMEOUT, compile_timeout + 1800)
+            if compile_timeout is not None
+            else VALIDATION_TIMEOUT
+        )
+        code, stdout, stderr = _exec(container_id, cmd, timeout=exec_timeout, check=False)
         if code != 0:
             logger.warning(
                 "Stage %d validate.py exited %d:\n%s\n%s",

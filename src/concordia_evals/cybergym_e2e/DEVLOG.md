@@ -144,4 +144,9 @@
   上游 README 的 vm.mmap_rnd_bits=28 只是降低冲突概率；我们的修复是
   compose 和验证容器都加 seccomp=unconfined（恢复路径通了，
   0/50 失败）。小任务（arduinojson）之前纯属侥幸没撞上。
+- [x] 第二个 ffmpeg 问题：seccomp 修复后编译正常开始，但 vendored
+  validate.py 的编译硬时限 3600s 在本机高负载下不够（ffmpeg MSan 全量
+  编译超时）。新增 validation_compile_timeout 参数（部署时对容器内副本做
+  限定范围的 sed，vendored 文件保持字节一致；4 处 timeout=3600 全是编译调用）
+- [ ] ffmpeg stage1 用 seccomp+7200s 验证（进行中）
 - [ ] ffmpeg 任务用修复后的配置重跑（待 stage1 验证确认后启动）
