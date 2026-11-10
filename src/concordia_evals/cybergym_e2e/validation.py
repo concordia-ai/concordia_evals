@@ -77,6 +77,13 @@ def _start_validation_container(
             # shadow-mmap collision recovery; default seccomp blocks it.
             "--security-opt",
             "seccomp=unconfined",
+            # ffmpeg-family tasks rsync FATE samples from fate-suite.ffmpeg.org
+            # during compile (rsync:// port 873); the transfer hangs on slow
+            # links and `|| true` only helps on failure, not on hangs. The
+            # samples are provably unused (upstream's own test.sh drops
+            # SAMPLES=), so fail the fetch fast via localhost.
+            "--add-host",
+            "fate-suite.ffmpeg.org:127.0.0.1",
             "-v",
             f"{task_data_dir}:/task_data:ro",
             "-v",

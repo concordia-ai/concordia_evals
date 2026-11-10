@@ -305,6 +305,11 @@ def write_compose_file(
                 # compiler sanity check trips on this). Verified 2026-11-10.
                 security_opt:
                   - seccomp=unconfined
+                # Make ffmpeg's FATE sample rsync fail fast instead of hanging
+                # on slow links (samples are unused: upstream test.sh drops
+                # SAMPLES=, and prepare.sh already made the fetch non-fatal).
+                extra_hosts:
+                  - "fate-suite.ffmpeg.org:127.0.0.1"
                 entrypoint:
                   - /bin/sh
                   - -c
