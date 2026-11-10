@@ -148,5 +148,16 @@
   validate.py 的编译硬时限 3600s 在本机高负载下不够（ffmpeg MSan 全量
   编译超时）。新增 validation_compile_timeout 参数（部署时对容器内副本做
   限定范围的 sed，vendored 文件保持字节一致；4 处 timeout=3600 全是编译调用）
-- [ ] ffmpeg stage1 用 seccomp+7200s 验证（进行中）
+- [x] 第三个 ffmpeg 问题：build.sh 的 `make fate-rsync`（拉取 FATE 测试样本，
+  rsync://fate-suite.ffmpeg.org:873）在慢网络下无限挂起。上游 prepare.sh 只加了
+  `|| true`（管失败不管挂起），上游 test.sh 已 drop SAMPLES=（样本确实不用）。
+  修复：agent compose + 验证容器都把 fate-suite.ffmpeg.org 指到 127.0.0.1，
+  rsync 本地秒拒 → build 继续。另有编排修正：外层 exec 时限必须 >
+  内层编译时限（此前两层都是 7200s 同时到期），现在外层 =
+  compile_timeout + 1800s 余量；agent 容器内的 validate.py 副本同样应用
+  compile_timeout 调整，保证 agent 自测与评分用同一编译预算
+- [x] 选题策略落地：sample_n + sample_seed + sample_method=diverse
+  （项目去重优先 + source/sanitizer 均衡），30 题清单已生成
+  （30 项目 / ASan 17 MSan 7 UBSan 6 / arvo 22 oss-fuzz 8 / c++ 24 c 6）
+- [ ] ffmpeg stage1 用 seccomp+7200s+fate shim 验证（进行中）
 - [ ] ffmpeg 任务用修复后的配置重跑（待 stage1 验证确认后启动）
