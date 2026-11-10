@@ -39,6 +39,7 @@ from concordia_evals.cybergym_e2e.dataset import (
     download_task_data,
     list_tasks,
     load_task_config,
+    stratified_sample,
     sync_scripts_repo,
     write_compose_file,
 )
@@ -107,6 +108,8 @@ def build_samples(
     data_dir: Path,
     compose_dir: Path,
     validation_compile_timeout: int | None = None,
+    sample_n: int | None = None,
+    sample_seed: int = 0,
 ) -> list[Sample]:
     """Build inspect Samples for the selected tasks (downloading as needed)."""
     all_tasks = list_tasks(repo_dir)
@@ -123,6 +126,8 @@ def build_samples(
         selected = all_tasks
     if limit is not None:
         selected = selected[:limit]
+    if sample_n is not None and len(selected) > sample_n:
+        selected = stratified_sample(selected, sample_n, sample_seed)
 
     samples: list[Sample] = []
     for task_path in selected:
@@ -176,6 +181,8 @@ def cybergym_e2e(
     tasks: list[str] | None = None,
     projects: list[str] | None = None,
     limit: int | None = None,
+    sample_n: int | None = None,
+    sample_seed: int = 0,
     lockdown: bool = True,
     validation_compile_timeout: int | None = None,
     solver: Solver | None = None,
@@ -198,6 +205,9 @@ def cybergym_e2e(
         tasks: Explicit task paths, e.g. ["curl/arvo_66012"].
         projects: Project filter, e.g. ["curl", "mruby"].
         limit: Max number of samples (after other filters).
+        sample_n: If set, draw a project-stratified random subset of this
+            size from the selected tasks (reproducible via sample_seed).
+        sample_seed: Seed for the stratified sampling (default 0).
         lockdown: Disconnect the agent container from all networks after
             setup (the agent bridge still works over loopback/exec).
         validation_compile_timeout: Override the vendored validate.py's
@@ -241,6 +251,8 @@ def cybergym_e2e(
                 data_dir=DATA_DIR,
                 compose_dir=COMPOSE_DIR,
                 validation_compile_timeout=validation_compile_timeout,
+                sample_n=sample_n,
+                sample_seed=sample_seed,
             )
         ),
         solver=solver,

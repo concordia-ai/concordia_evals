@@ -102,6 +102,39 @@ def list_tasks(repo_dir: Path = REPO_DIR) -> list[str]:
     return tasks
 
 
+def stratified_sample(tasks: list[str], n: int, seed: int) -> list[str]:
+    """Pick n tasks with project-level diversity, reproducibly.
+
+    Round-robin across projects (shuffled task pool per project): the first
+    pass takes one task per project, later passes add depth. Same seed and
+    task list always give the same subset.
+    """
+    import random
+
+    rng = random.Random(seed)
+    pools: list[list[str]] = []
+    by_project: dict[str, list[str]] = {}
+    for task in tasks:
+        by_project.setdefault(task.split("/", 1)[0], []).append(task)
+    for project in sorted(by_project):
+        pool = sorted(by_project[project])
+        rng.shuffle(pool)
+        pools.append(pool)
+
+    picked: list[str] = []
+    while len(picked) < n:
+        added = False
+        for pool in pools:
+            if pool:
+                picked.append(pool.pop())
+                added = True
+                if len(picked) >= n:
+                    break
+        if not added:
+            break
+    return sorted(picked)
+
+
 def load_task_config(task_path: str, repo_dir: Path = REPO_DIR) -> dict[str, Any]:
     """Load merged config (project.toml overlaid with task config.toml)."""
     script_dir = repo_dir / "projects" / task_path

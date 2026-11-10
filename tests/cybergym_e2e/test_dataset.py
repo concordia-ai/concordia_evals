@@ -81,3 +81,21 @@ def test_write_compose_file(tmp_path: Path):
     assert "image: example/alpha:1" in content
     assert f"{tmp_path}/data:/task_data:ro" in content
     assert f"{tmp_path}/scripts:/task_scripts:ro" in content
+
+
+def test_stratified_sample_diverse_and_reproducible():
+    from concordia_evals.cybergym_e2e.dataset import stratified_sample
+
+    tasks = [f"proj{p}/t{i}" for p in range(5) for i in range(10)]
+    a = stratified_sample(tasks, 12, seed=7)
+    b = stratified_sample(tasks, 12, seed=7)
+    assert a == b  # reproducible
+    assert len(a) == 12
+    projects = {t.split("/")[0] for t in a}
+    assert len(projects) == 5  # all projects represented
+    # more tasks than pools: falls back to depth
+    c = stratified_sample(["a/1", "b/1", "b/2", "b/3"], 3, seed=1)
+    assert len(c) == 3
+    # n >= len(tasks) returns everything
+    d = stratified_sample(["a/1", "b/1"], 10, seed=1)
+    assert sorted(d) == ["a/1", "b/1"]
