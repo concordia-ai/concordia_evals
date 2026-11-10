@@ -128,7 +128,20 @@
   （2026-11-09，22 min，4.4M tokens：I 179k / CR 4.1M / O 70k / R 57k）。
   model_config 修正后经典函数工具与 deepseek 模型配合正常。
   至此两个首发 harness（kimi_code / codex_cli）在真实任务上全链路验证完毕。
-- [ ] 真实任务 + 真 agent 冒烟：等 HF token（用户申请中）。
-  网关已确认可用模型（OPENAI_BASE_URL 内部网关）：kimi-k2.5/k2.6/k3、
-  deepseek-v4-pro/flash、gpt-5.x/6、claude-opus-4-8、glm-5.x、qwen 等，
-  足够覆盖 model × harness 矩阵。
+
+### 2026-11-10
+
+- [x] 随机 3 任务边界测试（kimi_code + deepseek-v4.1-flash，3.1h）：
+  binutils/arvo_40683 全阶段过；libdwarf/arvo_66646 S1-S3 过 S4 败
+  （修了一个真实但非目标的漏洞，论文 S3-S4 gap 的实例）；
+  ffmpeg/oss-fuzz_42537686 S1=error（基础设施问题，非 agent 失败）
+- [x] **根因定位（ffmpeg error）**：MSan 二进制启动时在影子内存 mmap 与
+  ASLR 冲突（~50% 概率）后走 personality(ADDR_NO_RANDOMIZE) 重 exec 恢复，
+  但 docker 默认 seccomp 按值精确匹配 personality()，组合值被拒 →
+  "MemorySanitizer: CHECK failed: msan_linux.cpp:192 personality..."（50/50
+  复现）。ffmpeg 的 compile.sh 用 meson 编依赖，sanity check 跑测试二进制
+  命中该问题 → "Executables created by c compiler clang are not runnable"。
+  上游 README 的 vm.mmap_rnd_bits=28 只是降低冲突概率；我们的修复是
+  compose 和验证容器都加 seccomp=unconfined（恢复路径通了，
+  0/50 失败）。小任务（arduinojson）之前纯属侥幸没撞上。
+- [ ] ffmpeg 任务用修复后的配置重跑（待 stage1 验证确认后启动）

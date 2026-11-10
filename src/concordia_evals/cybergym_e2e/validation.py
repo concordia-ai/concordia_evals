@@ -73,6 +73,10 @@ def _start_validation_container(
             "run",
             "-d",
             "--rm",
+            # MSan/ASan binaries need personality(ADDR_NO_RANDOMIZE) for their
+            # shadow-mmap collision recovery; default seccomp blocks it.
+            "--security-opt",
+            "seccomp=unconfined",
             "-v",
             f"{task_data_dir}:/task_data:ro",
             "-v",
@@ -95,6 +99,7 @@ def _setup_validation_container(
     repo_to_patch: str,
     immutable_files: list[str],
     pre_patches: list[str],
+    compile_timeout: int | None = None,
 ) -> None:
     """Set up a fresh validation container (upstream setup_workspace, run_prepare=False)."""
     from concordia_evals.cybergym_e2e.setup_solver import _sanitized_config_toml
@@ -112,6 +117,26 @@ def _setup_validation_container(
     _exec(container_id, INSTALL_VALIDATE_DEPS, timeout=1200)
 
     _docker(["cp", str(VENDOR_DIR / "validate.py"), f"{container_id}:/scripts/validate.py"])
+    if compile_timeout is not None:
+        # Documented, opt-in deviation: the vendored validate.py hardcodes a
+        # 3600s compile timeout (exactly 4 occurrences, all compile.sh calls).
+        # Large projects (e.g. ffmpeg with MSan) exceed this on loaded hosts.
+        # The vendored file stays byte-identical; only the deployed copy is
+        # adjusted, and only when the caller explicitly sets a timeout.
+        code, out, _ = _exec(
+            container_id,
+            f"sed -i 's/timeout=3600/timeout={compile_timeout}/g' /scripts/validate.py "
+            "&& grep -c 'timeout=3600' /scripts/validate.py || true",
+            check=False,
+        )
+        if code != 0:
+            raise RuntimeError("Failed to adjust validate.py compile timeout")
+        remaining = out.strip()
+        if remaining != "0":
+            raise RuntimeError(
+                f"Unexpected validate.py state after timeout adjustment: "
+                f"{remaining} occurrences of timeout=3600 remain"
+            )
     _exec(
         container_id,
         "cp /task_data/src.tgz /src/src.tgz && tar xf /src/src.tgz -C /src && rm /src/src.tgz",
@@ -173,6 +198,7 @@ def run_stage_validation(
     script_dir: Path,
     poc_path: Path | None,
     patch_path: Path | None,
+    compile_timeout: int | None = None,
 ) -> StageStatus:
     """Run one validation stage in a fresh container; return its status."""
     container_id: str | None = None
@@ -185,6 +211,7 @@ def run_stage_validation(
             repo_to_patch=repo_to_patch,
             immutable_files=immutable_files,
             pre_patches=pre_patches,
+            compile_timeout=compile_timeout,
         )
 
         if poc_path is not None and stage in (1, 2):
@@ -251,6 +278,7 @@ def run_full_validation(
     script_dir: Path,
     poc_path: Path | None,
     patch_path: Path | None,
+    compile_timeout: int | None = None,
 ) -> dict[str, StageStatus | None]:
     """Run all applicable stages with upstream's cumulative skip logic."""
     results: dict[str, StageStatus | None] = {
@@ -282,5 +310,6 @@ def run_full_validation(
             script_dir=script_dir,
             poc_path=poc_path,
             patch_path=patch_path,
+            compile_timeout=compile_timeout,
         )
     return results

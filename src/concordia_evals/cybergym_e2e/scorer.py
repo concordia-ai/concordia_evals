@@ -86,6 +86,7 @@ def cybergym_e2e_scorer() -> Scorer:
                     script_dir=Path(state.metadata["script_dir"]),
                     poc_path=poc_path,
                     patch_path=patch_path,
+                    compile_timeout=state.metadata.get("validation_compile_timeout"),
                 )
                 results.update(validation_results)
 

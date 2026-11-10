@@ -196,6 +196,13 @@ def write_compose_file(
                   - {task_data_dir}:/task_data:ro
                   - {script_dir}:/task_scripts:ro
                 working_dir: /src
+                # MSan/ASan fuzzer binaries re-exec via
+                # personality(ADDR_NO_RANDOMIZE) when their shadow-memory mmap
+                # collides; Docker's default seccomp profile blocks the combined
+                # personality value, killing ~50% of MSan binary runs (meson's
+                # compiler sanity check trips on this). Verified 2026-11-10.
+                security_opt:
+                  - seccomp=unconfined
                 entrypoint:
                   - /bin/sh
                   - -c

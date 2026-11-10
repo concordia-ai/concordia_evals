@@ -106,6 +106,7 @@ def build_samples(
     repo_dir: Path,
     data_dir: Path,
     compose_dir: Path,
+    validation_compile_timeout: int | None = None,
 ) -> list[Sample]:
     """Build inspect Samples for the selected tasks (downloading as needed)."""
     all_tasks = list_tasks(repo_dir)
@@ -158,6 +159,7 @@ def build_samples(
                     "task_data_dir": str(task_data_dir),
                     "script_dir": str(script_dir),
                     "compose_file": compose_file,
+                    "validation_compile_timeout": validation_compile_timeout,
                 },
             )
         )
@@ -175,6 +177,7 @@ def cybergym_e2e(
     projects: list[str] | None = None,
     limit: int | None = None,
     lockdown: bool = True,
+    validation_compile_timeout: int | None = None,
     solver: Solver | None = None,
 ) -> Task:
     """CyberGym-E2E evaluation task.
@@ -197,6 +200,10 @@ def cybergym_e2e(
         limit: Max number of samples (after other filters).
         lockdown: Disconnect the agent container from all networks after
             setup (the agent bridge still works over loopback/exec).
+        validation_compile_timeout: Override the vendored validate.py's
+            hardcoded 3600s compile timeout on the deployed in-container copy
+            (needed for large projects like ffmpeg on loaded hosts). The
+            vendored file stays byte-identical; default None = upstream value.
         solver: Full custom solver chain (overrides the default chain).
 
     Returns:
@@ -233,6 +240,7 @@ def cybergym_e2e(
                 repo_dir=repo_dir,
                 data_dir=DATA_DIR,
                 compose_dir=COMPOSE_DIR,
+                validation_compile_timeout=validation_compile_timeout,
             )
         ),
         solver=solver,
