@@ -135,6 +135,75 @@ def stratified_sample(tasks: list[str], n: int, seed: int) -> list[str]:
     return sorted(picked)
 
 
+def _task_attributes(task_path: str, repo_dir: Path) -> tuple[str, str, str, str]:
+    """Extract (project, language, source_family, sanitizer) for a task.
+
+    language comes from project.toml; source family from the task dir name
+    prefix (arvo_ / oss-fuzz_); sanitizer from run_poc.sh's SANITIZER= line.
+    """
+    import re
+
+    project, name = task_path.split("/", 1)
+    config = load_task_config(task_path, repo_dir)
+    language = config.get("language", "unknown")
+    if name.startswith("arvo_"):
+        source = "arvo"
+    elif name.startswith("oss-fuzz_"):
+        source = "oss-fuzz"
+    else:
+        source = "other"
+    sanitizer = "unknown"
+    run_poc = repo_dir / "projects" / task_path / "run_poc.sh"
+    if run_poc.exists():
+        match = re.search(r"SANITIZER=(\w+)", run_poc.read_text())
+        if match:
+            sanitizer = match.group(1)
+    return project, language, source, sanitizer
+
+
+def diverse_sample(tasks: list[str], n: int, seed: int, repo_dir: Path = REPO_DIR) -> list[str]:
+    """Pick n tasks maximizing coverage: distinct projects first, then balance attributes.
+
+    Within each project prefer the task whose (source, sanitizer) combination is
+    currently least represented. Reproducible via seed.
+    """
+    import random
+
+    rng = random.Random(seed)
+    attrs = {t: _task_attributes(t, repo_dir) for t in tasks}
+
+    by_project: dict[str, list[str]] = {}
+    for task in tasks:
+        by_project.setdefault(task.split("/", 1)[0], []).append(task)
+    projects = sorted(by_project)
+    rng.shuffle(projects)
+
+    picked: list[str] = []
+    combo_count: dict[tuple[str, str], int] = {}
+    while len(picked) < n:
+        added = False
+        for project in projects:
+            pool = [t for t in by_project[project] if t not in picked]
+            if not pool:
+                continue
+            # Within this project, prefer the task whose (source, sanitizer)
+            # combo is globally least represented so far; ties: seeded order.
+            rng.shuffle(pool)
+            best = min(
+                pool,
+                key=lambda t: combo_count.get((attrs[t][2], attrs[t][3]), 0),
+            )
+            picked.append(best)
+            combo = (attrs[best][2], attrs[best][3])
+            combo_count[combo] = combo_count.get(combo, 0) + 1
+            added = True
+            if len(picked) >= n:
+                break
+        if not added:
+            break
+    return sorted(picked)
+
+
 def load_task_config(task_path: str, repo_dir: Path = REPO_DIR) -> dict[str, Any]:
     """Load merged config (project.toml overlaid with task config.toml)."""
     script_dir = repo_dir / "projects" / task_path

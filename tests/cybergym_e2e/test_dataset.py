@@ -99,3 +99,26 @@ def test_stratified_sample_diverse_and_reproducible():
     # n >= len(tasks) returns everything
     d = stratified_sample(["a/1", "b/1"], 10, seed=1)
     assert sorted(d) == ["a/1", "b/1"]
+
+
+def test_diverse_sample(tmp_path):
+    from concordia_evals.cybergym_e2e.dataset import diverse_sample
+
+    # 构造带属性的假仓：3 个项目 × 4 题，sanitizer/source 各异
+    repo = tmp_path / "repo"
+    for p, lang in [("pa", "c++"), ("pb", "c"), ("pc", "c++")]:
+        (repo / "projects" / p).mkdir(parents=True)
+        (repo / "projects" / p / "project.toml").write_text(f'name = "{p}"\nlanguage = "{lang}"\n')
+        for i, (src, san) in enumerate([("arvo", "address"), ("arvo", "memory"), ("oss-fuzz", "address"), ("arvo", "undefined")]):
+            name = f"{src}_{i}" if src == "arvo" else f"oss-fuzz_{i}"
+            d = repo / "projects" / p / name
+            d.mkdir()
+            (d / "config.toml").write_text(f'task_id = "x:{i}"\n')
+            (d / "run_poc.sh").write_text(f"export SANITIZER={san}\n")
+    tasks = [f"{p}/{n}" for p in ("pa", "pb", "pc") for n in ("arvo_0", "arvo_1", "oss-fuzz_2", "arvo_3")]
+    a = diverse_sample(tasks, 3, seed=5, repo_dir=repo)
+    b = diverse_sample(tasks, 3, seed=5, repo_dir=repo)
+    assert a == b and len(a) == 3
+    assert {t.split("/")[0] for t in a} == {"pa", "pb", "pc"}  # 每项目一题
+    # 项目数 > n 时也只取 n 题
+    assert len(diverse_sample(tasks, 2, seed=5, repo_dir=repo)) == 2

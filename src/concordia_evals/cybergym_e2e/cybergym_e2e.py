@@ -36,6 +36,7 @@ from concordia_evals.cybergym_e2e.dataset import (
     DATA_DIR,
     DEFAULT_BUILD_IMAGE,
     REPO_DIR,
+    diverse_sample,
     download_task_data,
     list_tasks,
     load_task_config,
@@ -110,6 +111,7 @@ def build_samples(
     validation_compile_timeout: int | None = None,
     sample_n: int | None = None,
     sample_seed: int = 0,
+    sample_method: str = "diverse",
 ) -> list[Sample]:
     """Build inspect Samples for the selected tasks (downloading as needed)."""
     all_tasks = list_tasks(repo_dir)
@@ -127,7 +129,12 @@ def build_samples(
     if limit is not None:
         selected = selected[:limit]
     if sample_n is not None and len(selected) > sample_n:
-        selected = stratified_sample(selected, sample_n, sample_seed)
+        if sample_method == "diverse":
+            selected = diverse_sample(selected, sample_n, sample_seed, repo_dir)
+        elif sample_method == "stratified":
+            selected = stratified_sample(selected, sample_n, sample_seed)
+        else:
+            raise ValueError(f"Unknown sample_method: {sample_method!r}")
 
     samples: list[Sample] = []
     for task_path in selected:
@@ -185,6 +192,7 @@ def cybergym_e2e(
     sample_seed: int = 0,
     lockdown: bool = True,
     validation_compile_timeout: int | None = None,
+    sample_method: str = "diverse",
     solver: Solver | None = None,
 ) -> Task:
     """CyberGym-E2E evaluation task.
@@ -205,9 +213,12 @@ def cybergym_e2e(
         tasks: Explicit task paths, e.g. ["curl/arvo_66012"].
         projects: Project filter, e.g. ["curl", "mruby"].
         limit: Max number of samples (after other filters).
-        sample_n: If set, draw a project-stratified random subset of this
-            size from the selected tasks (reproducible via sample_seed).
-        sample_seed: Seed for the stratified sampling (default 0).
+        sample_n: If set, draw a subset of this size from the selected tasks
+            (reproducible via sample_seed).
+        sample_seed: Seed for subset sampling (default 0).
+        sample_method: "diverse" (default; distinct projects first, then
+            balance source-family/sanitizer coverage) or "stratified"
+            (plain project round-robin).
         lockdown: Disconnect the agent container from all networks after
             setup (the agent bridge still works over loopback/exec).
         validation_compile_timeout: Override the vendored validate.py's
@@ -253,6 +264,7 @@ def cybergym_e2e(
                 validation_compile_timeout=validation_compile_timeout,
                 sample_n=sample_n,
                 sample_seed=sample_seed,
+                sample_method=sample_method,
             )
         ),
         solver=solver,
