@@ -20,8 +20,15 @@ classifiers = [
 ]
 dependencies = [
     "inspect_ai >= 0.3.221",
-    "datasets >= 4.8.5",
-    "huggingface-hub >= 1.2.0",
+    # only load_dataset(..., revision=...) is used, which predates 4.x by far.
+    # a high floor here forces an upgrade of datasets (and therefore pyarrow)
+    # inside an existing environment that already works.
+    "datasets >= 2.19",
+    "huggingface-hub >= 0.25",
+    # pyarrow (pulled in by datasets) refuses numpy 1.x at runtime but declares
+    # no numpy requirement, so a resolution can land on pyarrow>=24 + numpy 1.x
+    # and then fail at import time. depend on it explicitly.
+    "numpy >= 2.0",
     "docker",
     "platformdirs",
     "beautifulsoup4 >= 4.10.0",
@@ -40,6 +47,9 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/concordia-ai/concordia_evals"
 Repository = "https://github.com/concordia-ai/concordia_evals"
+
+[project.entry-points.inspect_ai]
+concordia_evals = "concordia_evals._registry"
 
 [build-system]
 requires = ["setuptools>=61.0", "setuptools_scm[toml]>=8.0"]
