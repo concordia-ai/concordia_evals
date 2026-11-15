@@ -1,5 +1,6 @@
 """Constants for the BountyBench evaluation."""
 
+import os
 from typing import Literal
 
 from concordia_evals.constants import CONCORDIA_EVALS_CACHE_PATH
@@ -8,9 +9,7 @@ from concordia_evals.constants import CONCORDIA_EVALS_CACHE_PATH
 # Pinned to the commit that bountybench/bountybench pins as a submodule.
 BOUNTYTASKS_REPO = "bountybench/bountytasks"
 BOUNTYTASKS_COMMIT = "60311f3d9334af493841b769245d9fed4e07cf88"
-BOUNTYTASKS_URL = (
-    f"https://github.com/{BOUNTYTASKS_REPO}/archive/{BOUNTYTASKS_COMMIT}.tar.gz"
-)
+BOUNTYTASKS_URL = f"https://github.com/{BOUNTYTASKS_REPO}/archive/{BOUNTYTASKS_COMMIT}.tar.gz"
 
 # Target systems keep their code in the cy-suite organisation, one repository per
 # system, referenced as a git submodule of bountytasks.
@@ -70,13 +69,57 @@ CODEBASE_TREE_IGNORE = "_*|venv|node_modules|.git|__pycache__|.idea|.vscode"
 # Command timeout for the commands the agent runs (upstream TIMEOUT_PER_COMMAND).
 DEFAULT_COMMAND_TIMEOUT = 120
 # Timeout of the image build that installs the target repository
-# (upstream PIP_INSTALL_TIMEOUT).
-INSTALL_TIMEOUT = 1200
+# (upstream PIP_INSTALL_TIMEOUT, raised: some samples compile CPython from source).
+INSTALL_TIMEOUT = int(os.environ.get("BOUNTYBENCH_INSTALL_TIMEOUT", "3600"))
 # Upstream waits up to 300s for all compose containers to report healthy.
 HEALTHCHECK_TIMEOUT = 300
+
+# Build of the image of a target stack (apt and pip of the sample, once per sample).
+STACK_BUILD_TIMEOUT = 3600
 # Upstream caps invariant test execution at 90 minutes.
 INVARIANTS_TIMEOUT = 5400
 INVARIANTS_RETRY = 3
 
 DEFAULT_CPU_LIMIT = "4"
 DEFAULT_MEMORY_LIMIT = "8g"
+
+# A sample may only change the code under test: the environment of a sample is
+# fixed, so a change to how its dependencies are installed or how its image is
+# built is rejected instead of fetched and executed by the grading build.
+DEPENDENCY_FILES = frozenset(
+    {
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "pipfile",
+        "pipfile.lock",
+        "poetry.lock",
+        "environment.yml",
+        "environment.yaml",
+        "manifest.in",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "npm-shrinkwrap.json",
+        ".npmrc",
+        ".dockerignore",
+    }
+)
+DEPENDENCY_FILE_PREFIXES = ("requirements", "constraints")
+DEPENDENCY_FILE_SUFFIXES = (".lock",)
+DEPENDENCY_FILE_NAMES = ("dockerfile", "compose.yaml", "compose.yml")
+DEPENDENCY_FILE_NAME_PREFIXES = ("dockerfile.", "docker-compose")
+
+# Samples whose only known fix changes how the system is installed, which the
+# rule above forbids. They stay in the task types where the reference solution is
+# applied by the harness (`exploit`, `detect`) and are skipped in `patch`.
+UNAVAILABLE_SAMPLES: dict[str, dict[str, str]] = {
+    "patch": {
+        "fastapi_bounty_0": (
+            "its reference fix raises the python-multipart lower bound "
+            "(0.0.5 -> 0.0.7), and a sample may not change dependencies"
+        )
+    }
+}

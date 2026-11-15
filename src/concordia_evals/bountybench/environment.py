@@ -9,14 +9,20 @@ container names of the target stack.
 This module keeps that layout:
 
 * `Workspace` owns the host side working copy and drives the target containers.
+* the sample's own shell scripts (setup, invariants, verify) run in a second
+  container, `Workspace.run_script`, so that what they install cannot touch the
+  evaluator's python environment while they still reach the target stack.
 * the `sbx_*` helpers prepare and drive the agent container, which is the
   Inspect docker sandbox (`/app` mirrors the upstream agent workspace).
 """
 
 import atexit
 import base64
+import hashlib
 import io
+import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -24,9 +30,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from inspect_ai.util import ExecResult, SandboxEnvironment
 
@@ -41,11 +50,13 @@ from concordia_evals.bountybench.constants import (
     SAMPLE_IMAGES_DIR,
     SANDBOX_APP_DIR,
     SANDBOX_CODEBASE_DIR,
+    SANDBOX_COMPOSE_DIR,
     SANDBOX_EXPLOIT_DIR,
     SANDBOX_MIRROR_DIR,
     SANDBOX_VERIFY_DIR,
     SANDBOX_WHEELHOUSE,
     SHARED_NETWORK,
+    STACK_BUILD_TIMEOUT,
     WORKSPACES_DIR,
 )
 from concordia_evals.bountybench.data import (
@@ -74,7 +85,10 @@ _LIVE_WORKSPACES: dict[str, "Workspace"] = {}
 
 
 def run_host(
-    command: list[str], cwd: Path | None = None, timeout: int | None = None
+    command: list[str],
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command on the evaluator host."""
     return subprocess.run(
@@ -84,6 +98,7 @@ def run_host(
         text=True,
         timeout=timeout,
         check=False,
+        env={**os.environ, **env} if env else None,
     )
 
 
@@ -98,9 +113,7 @@ def ensure_shared_network(name: str = SHARED_NETWORK) -> None:
     if existing.returncode != 0:
         raise RuntimeError(f"Docker is not available: {existing.stderr.strip()}")
     if name in existing.stdout.split():
-        internal = run_host(
-            ["docker", "network", "inspect", "--format", "{{.Internal}}", name]
-        )
+        internal = run_host(["docker", "network", "inspect", "--format", "{{.Internal}}", name])
         if internal.stdout.strip() == "true":
             return
         removed = run_host(["docker", "network", "rm", name])
@@ -143,7 +156,21 @@ def ensure_agent_image(tag: str = AGENT_IMAGE) -> None:
 
 def sample_image_tag(spec: BountySpec) -> str:
     """Image of one sample: the agent image plus the installed target repository."""
-    return f"{AGENT_IMAGE_NAME}-{spec.system}-{spec.bounty_number}:latest"
+    # Docker tags are lowercase only, while some bounty systems (e.g. LibreChat)
+    # keep the upstream casing.
+    return f"{AGENT_IMAGE_NAME}-{spec.system.lower()}-{spec.bounty_number}:latest"
+
+
+def stack_image_tag(spec: BountySpec, service: str) -> str:
+    """Image of one service of a sample's stack.
+
+    Named after the sample instead of the workspace: the image is built from the
+    vulnerable checkout and carries the installed dependencies, so it must be
+    built once and reused by every later run (a rebuild would download packages
+    while the evaluation runs).
+    """
+    name = f"bb-stack-{spec.system}-{spec.bounty_number}-{service}"
+    return f"{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}:latest"
 
 
 def install_script(
@@ -154,9 +181,7 @@ def install_script(
     Returns None for repositories that are not installed (node), as upstream.
     """
     if is_python is None:
-        python_repo = (codebase / "setup.py").exists() or (
-            codebase / "pyproject.toml"
-        ).exists()
+        python_repo = (codebase / "setup.py").exists() or (codebase / "pyproject.toml").exists()
     else:
         python_repo = is_python
     if python_repo:
@@ -165,6 +190,98 @@ def install_script(
         return None
     return install_command or "make install"
 
+
+# Container that runs a sample's own shell scripts (setup, invariants, verify).
+# It is a shell in the sample image that shares the docker socket, so the
+# scripts drive their compose stack and `docker exec` into the target containers
+# as they do on the host, while whatever they install lands in the container
+# instead of the evaluator's python environment.
+GRADER_CONTAINER_PREFIX = "bb-grader-"
+DOCKER_SOCKET = Path("/var/run/docker.sock")
+
+# The scripts of a service system talk to its stack at `localhost:<published
+# port>`; the grading container reaches the same stack by service name on the
+# compose network, so the loopback ports are forwarded to it. It looks at the
+# stack every few seconds while a script runs, because the scripts bring the
+# stack up themselves and poll `localhost:<port>` in the same run.
+STACK_SYNC_INTERVAL = 5
+FORWARDER_PATH = "/tmp/bb-forward.py"
+COMPOSE_OVERRIDES_DIR = SANDBOX_COMPOSE_DIR / "overrides"
+# Build contexts of the stack images: the target checkout at the vulnerable
+# commit, so that a patched workspace does not rebuild the dependency layers.
+COMPOSE_BUILD_DIR = SANDBOX_COMPOSE_DIR / "build"
+# Dockerfile each stack image was built from, so that a sample whose image is
+# already built is not built again.
+COMPOSE_IMAGE_DIR = SANDBOX_COMPOSE_DIR / "images"
+
+# Where a container keeps the revision of the code it was given, so that the
+# workspace is only copied in again once it changed.
+CODE_STAMP_PATH = "/tmp/.concordia-code-stamp"
+
+# Indexes the agent image installs from (see `Dockerfile`); the bounties' own
+# Dockerfiles are written for the public PyPI and distro mirrors, which are slow
+# from some networks (`apt-get install curl` alone can take five minutes).
+PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# Node samples install from the public npm registry (seven seconds per request
+# from here) and node-gyp downloads node headers from a host that is not
+# reachable at all; the official images keep their headers in /usr/local.
+NPM_REGISTRY_URL = "https://registry.npmmirror.com"
+NODE_HEADERS_DIR = "/usr/local"
+# Plain HTTP over a mirror that does not redirect to HTTPS: the images of some
+# bounties have no CA certificates installed, so a redirect to HTTPS fails to
+# verify ("No system certificates available").
+APT_MIRROR_URL = "http://mirrors.tuna.tsinghua.edu.cn"
+# `security.debian.org` is left alone: a mirror of the security pocket can lag
+# the versions its own index lists, and `apt-get install` then fails with a 404
+# for a package the index names (the pocket is small, the official host is fine).
+APT_MIRROR_SCRIPT = (
+    "for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources "
+    "/etc/apt/sources.list.d/*.list /etc/apk/repositories; do "
+    '[ -f "$f" ] || continue; '
+    # `deb.debian.org/debian-security` is the security pocket as well: a mirror of
+    # it can lag the versions its own index lists, so it keeps the official host
+    "sed -i -E 's#https?://deb\\.debian\\.org/debian-security"
+    "#http://security.debian.org/debian-security#g; "
+    f"s#https?://(deb|archive)\\.debian\\.org#{APT_MIRROR_URL}#g; "
+    f"s#https?://archive\\.ubuntu\\.com#{APT_MIRROR_URL}#g; "
+    f's#https?://dl-cdn\\.alpinelinux\\.org#{APT_MIRROR_URL}#g\' "$f"; '
+    "done"
+)
+FORWARDER_SCRIPT = """\
+import socket, socketserver, sys, threading
+
+local, host, port = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+target = (host, port)
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        upstream = socket.create_connection(target, 30)
+
+        def pipe(source, sink):
+            try:
+                while data := source.recv(65536):
+                    sink.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for sock in (source, sink):
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=pipe, args=(upstream, self.request), daemon=True).start()
+        pipe(self.request, upstream)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+Server(("127.0.0.1", local), Handler).serve_forever()
+"""
 
 # Packages the grading scripts need on top of what they ask for: pip itself (the
 # scripts run `pip install --upgrade pip`) and the build backends of the
@@ -181,18 +298,33 @@ WHEELHOUSE_BASELINE = (
     "poetry-core",
     "pdm-backend",
     "cython",
+    # what those backends need in a build isolation environment: without them pip
+    # cannot build an sdist while the grading container has no index
+    "editables",
+    "pathspec",
+    "pluggy",
+    "trove-classifiers",
 )
 
-GRADING_SCRIPTS = (
+# Tools the samples' own scripts install on the grading host at run time
+# (`apt-get install sqlite3` in the setup of `mlflow`), baked into the image so
+# that grading needs no package index.
+GRADING_TOOLS: dict[str, tuple[str, ...]] = {"mlflow": ("sqlite3",)}
+
+# Scripts a sample runs while it is prepared and graded, and that install
+# packages with pip while doing it.
+SYSTEM_SCRIPTS = (
+    ("setup_repo_env.sh",),
     ("run_repo_invariants.sh",),
+)
+BOUNTY_SCRIPTS = (
+    ("setup_files", "setup_bounty_env.sh"),
     ("run_bounty_invariants.sh",),
     ("verify_files", "verify.sh"),
     ("verify.sh",),
 )
 
-_PIP_INSTALL = re.compile(
-    r"^\s*(?:sudo\s+)?(?:python[0-9.]*\s+-m\s+)?pip[0-9.]*\s+install\s+(.*)$"
-)
+_PIP_INSTALL = re.compile(r"^\s*(?:sudo\s+)?(?:python[0-9.]*\s+-m\s+)?pip[0-9.]*\s+install\s+(.*)$")
 _PIP_FLAGS_WITH_VALUE = {
     "-r",
     "--requirement",
@@ -212,6 +344,9 @@ _PIP_FLAGS_WITH_VALUE = {
     "--cache-dir",
     "--progress-bar",
 }
+# `>`, `>>`, `2>&1`, `/dev/null`: shell redirections a pip line may carry.
+# `numpy<2` is a version specifier and must not be mistaken for one.
+_REDIRECTION = re.compile(r"\d*[<>]&?\d*|&>\S*|/dev/null|\d*>\S*")
 _PIP_FLAGS_WITHOUT_VALUE = {
     "-q",
     "--quiet",
@@ -230,20 +365,21 @@ _PIP_FLAGS_WITHOUT_VALUE = {
 }
 
 
+def sample_scripts(spec: BountySpec) -> list[Path]:
+    """Shell scripts of the dataset that a sample runs while it is graded."""
+    scripts = [spec.system_dir.joinpath(*parts) for parts in SYSTEM_SCRIPTS]
+    return [*scripts, *(spec.bounty_dir.joinpath(*parts) for parts in BOUNTY_SCRIPTS)]
+
+
 def grading_requirements(spec: BountySpec) -> tuple[list[str], list[str]]:
-    """Collect what the grading scripts of a sample install with pip.
+    """Collect what the sample's own scripts install with pip.
 
     Returns the PyPI requirements and the local paths (`./codebase`, `.[dev]`)
     the scripts install, so that both can be fetched while building the image.
     """
     requirements: set[str] = set()
     local: set[str] = set()
-    for parts in GRADING_SCRIPTS:
-        script = (
-            spec.bounty_dir.joinpath(*parts)
-            if parts[0] != "run_repo_invariants.sh"
-            else spec.system_dir.joinpath(*parts)
-        )
+    for script in sample_scripts(spec):
         if not script.exists():
             continue
         text = script.read_text(errors="replace").replace("\\\n", " ")
@@ -256,16 +392,122 @@ def grading_requirements(spec: BountySpec) -> tuple[list[str], list[str]]:
             while index < len(tokens):
                 token = tokens[index]
                 index += 1
+                if token in ("-r", "--requirement", "-c", "--constraint"):
+                    # a file of requirements, resolved where the script run would
+                    # find it: next to the script, or in the checkout it installs
+                    path = tokens[index] if index < len(tokens) else ""
+                    index += 1
+                    resolved = _requirement_file(path, script.parent, spec)
+                    if resolved is not None:
+                        requirements.update(
+                            _requirements_of(
+                                lambda name: Path(name).read_text(errors="replace")
+                                if Path(name).is_file()
+                                else None,
+                                str(resolved),
+                            )
+                        )
+                    elif path:
+                        # `cd ./codebase && pip install -r ...`: read it from the
+                        # mirror of the checkout the script installs
+                        requirements.update(_requirements_in_checkout(spec, path))
+                    continue
                 if token in _PIP_FLAGS_WITH_VALUE:
                     index += 1
                     continue
                 if token in _PIP_FLAGS_WITHOUT_VALUE or token.startswith("-"):
+                    continue
+                if _REDIRECTION.fullmatch(token):
+                    # a redirection left over from the line, not a package
                     continue
                 if token.startswith((".", "/", "~")) or token.endswith(".txt"):
                     local.add(token)
                 else:
                     requirements.add(token)
     return sorted(requirements), sorted(local)
+
+
+def _requirement_file(path: str, script_dir: Path, spec: BountySpec) -> Path | None:
+    """Requirement file a script names, when it is on disk next to the script."""
+    if not path or path.startswith(("-", "/")):
+        return None
+    for candidate in (script_dir / path, spec.system_dir / path):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _requirements_of(
+    read: Callable[[str], str | None],
+    path: str,
+    seen: frozenset[str] = frozenset(),
+) -> set[str]:
+    """Requirements of a requirements file, following nested `-r` files."""
+    text = read(path)
+    if text is None:
+        return set()
+    requirements: set[str] = set()
+    directory = os.path.dirname(path)
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith(("-r ", "--requirement ")):
+            nested = os.path.normpath(os.path.join(directory, line.split(maxsplit=1)[1].strip()))
+            if nested not in seen:
+                requirements |= _requirements_of(read, nested, seen | {path})
+            continue
+        if line.startswith("-"):
+            continue
+        requirements.add(line)
+    return requirements
+
+
+def _requirements_in_checkout(spec: BountySpec, path: str) -> set[str]:
+    """Requirements of a file of the target checkout, read from its git mirror.
+
+    The checkout of the task data is a submodule, so it is empty on disk; the
+    mirror holds the tree of the vulnerable commit.
+    """
+    mirror = ensure_codebase_mirror(spec)
+
+    def read(name: str) -> str | None:
+        shown = run_host(["git", "show", f"{spec.vulnerable_commit}:{name}"], cwd=mirror)
+        return shown.stdout if shown.returncode == 0 else None
+
+    return _requirements_of(read, path.lstrip("./"))
+
+
+def checkout_install_commands(spec: BountySpec) -> list[str]:
+    """`pip install` runs of the sample's own scripts that install its checkout.
+
+    Service systems install their repository from inside `setup_repo_env.sh`,
+    which takes minutes at run time. The commands are returned with the checkout
+    path rewritten to the directory root, so that the image build can install the
+    same thing once.
+    """
+    commands: list[str] = []
+    for script in sample_scripts(spec):
+        if not script.exists():
+            continue
+        text = script.read_text(errors="replace").replace("\\\n", " ")
+        for line in text.splitlines():
+            match = _PIP_INSTALL.match(line)
+            if not match or line.lstrip().startswith("#"):
+                continue
+            tokens = shlex.split(match.group(1), comments=True)
+            if not any(token.startswith(("./codebase", "codebase")) for token in tokens):
+                continue
+            arguments = " ".join(
+                shlex.quote(
+                    codebase_relative(token)
+                    if token.startswith(("./codebase", "codebase"))
+                    else token
+                )
+                for token in tokens
+            )
+            commands.append(f"{line[: match.start(1)].strip()} {arguments}")
+    return commands
 
 
 def codebase_relative(path: str) -> str:
@@ -317,8 +559,17 @@ def sample_recipe(spec: BountySpec, command: str | None, wheelhouse: str | None)
     tasks run. Service tasks run their code in the compose stack instead and
     keep the image small: their checkout is mounted only for the install.
     """
+    tools = " ".join(GRADING_TOOLS.get(spec.system, ()))
+    tools_step = (
+        f"""# host tools the sample's own scripts would install while grading
+RUN apt-get update && apt-get install -y {tools}
+"""
+        if tools
+        else ""
+    )
     wheelhouse_step = (
-        f"""# offline package index for the grading scripts of this sample
+        f"""# offline package index for the sample's own scripts
+# wheelhouse sha256: {hashlib.sha256((wheelhouse or "").encode()).hexdigest()[:16]}
 COPY wheelhouse.sh /tmp/wheelhouse.sh
 RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
     bash /tmp/wheelhouse.sh
@@ -327,16 +578,20 @@ RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
         else ""
     )
     if spec.is_service_task:
-        install = (
-            f"""RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
-    cd {SANDBOX_CODEBASE_DIR} && {command}
+        installs = [command] if command else []
+        installs += checkout_install_commands(spec)
+        install = "".join(
+            f"""# What the sample's own setup installs on top of the repository, moved to
+# build time so that the run stage finds it already installed.
+RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
+    cd {SANDBOX_CODEBASE_DIR} && {step} \
+    || echo "the install of {spec.sample_id} failed"
 """
-            if command
-            else ""
+            for step in installs
         )
         return f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
 FROM {AGENT_IMAGE}
-{install}"""
+{tools_step}{install}{wheelhouse_step}"""
     install = (
         f"""# Not fatal, as upstream: a repository that fails to install still gives
 # the agent the code to read.
@@ -348,7 +603,7 @@ RUN cd {SANDBOX_CODEBASE_DIR} && {command} \
     )
     return f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
 FROM {AGENT_IMAGE}
-COPY codebase {SANDBOX_CODEBASE_DIR}
+{tools_step}COPY codebase {SANDBOX_CODEBASE_DIR}
 {install}# The artefacts of the install belong to the starting state, so they are
 # committed instead of showing up in the patch the agent submits.
 RUN cd {SANDBOX_CODEBASE_DIR} \
@@ -368,11 +623,13 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     context = cache_dir / f"{spec.system}_bounty_{spec.bounty_number}"
     codebase = context / "codebase"
     tag = sample_image_tag(spec)
-    # The grading scripts of a service system run on the host, so only samples
-    # that are graded inside the sandbox need the offline package index.
-    wheelhouse = (
-        None if spec.is_service_task else wheelhouse_script(*grading_requirements(spec))
-    )
+    # The sample's own scripts install packages both in the sandbox (local tasks)
+    # and in the container they are run in (service tasks), so every sample gets
+    # the offline index of its grading requirements.
+    requirements, local = grading_requirements(spec)
+    # the invariant suites install the checkout itself (`-e .`), so the
+    # dependencies of the project have to be in the wheelhouse as well
+    wheelhouse = wheelhouse_script(requirements, sorted({".", *local}))
     dockerfile = context / AGENT_DOCKERFILE
 
     def install() -> str | None:
@@ -391,8 +648,7 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     checkout_codebase(ensure_sandbox_mirror(spec), spec.vulnerable_commit, codebase)
     ensure_agent_image()
     context.mkdir(parents=True, exist_ok=True)
-    if wheelhouse is not None:
-        (context / "wheelhouse.sh").write_text(wheelhouse)
+    (context / "wheelhouse.sh").write_text(wheelhouse)
     dockerfile.write_text(sample_recipe(spec, install(), wheelhouse))
     logger.info(f"Building the sandbox image {tag} ({spec.sample_id})")
     built = run_host(
@@ -415,6 +671,153 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     return tag
 
 
+def base_images(dockerfile: Path) -> list[str]:
+    """Images a Dockerfile starts from, in order, without the empty ones."""
+    images: list[str] = []
+    for line in dockerfile.read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        instruction, *arguments = line.split()
+        if instruction.upper() != "FROM" or not arguments:
+            continue
+        image = next(part for part in arguments if not part.startswith("--"))
+        if image.lower() == "scratch" or image in images:
+            continue
+        images.append(image)
+    return images
+
+
+def pull_base_images(dockerfile: Path) -> None:
+    """Pull the base images of a Dockerfile.
+
+    The registry mirror refuses the manifest request of a `FROM` image that it has
+    not cached yet (`403 Forbidden`), which fails the build before it starts; a
+    pull warms it up. A failing pull is not an error: the build reports the real
+    problem, and the image may be present already.
+    """
+    for image in base_images(dockerfile):
+        pulled = run_host(["docker", "pull", image], timeout=INSTALL_TIMEOUT)
+        if pulled.returncode != 0:
+            logger.warning(f"Unable to pull the base image {image}: {pulled.stderr.strip()}")
+
+
+def _map_to_pristine(path: Path, workspace: Path, pristine: Path) -> Path:
+    """Same path inside the pristine copy of the workspace, when it is one."""
+    if not path.is_absolute():
+        return path
+    if path != workspace and workspace not in path.parents:
+        return path
+    return pristine / path.relative_to(workspace)
+
+
+def compose_file(directory: Path) -> Path | None:
+    """Compose file a script of `directory` drives, if any."""
+    for name in ("docker-compose.yml", "docker-compose.yaml"):
+        if (directory / name).exists():
+            return directory / name
+    return None
+
+
+def compose_definition(directory: Path, project: str) -> dict[str, Any]:
+    """Fully resolved definition of the stack a script of `directory` drives.
+
+    Some compose files take their ports from a `.env` file that the setup script
+    creates (`cp env .env`), so the stack is not resolvable before that script
+    runs. The file is then created the way the script creates it.
+    """
+    command = ["docker", "compose", "config", "--format", "json"]
+    configured = run_host(
+        command,
+        cwd=directory,
+        timeout=300,
+        env={"COMPOSE_PROJECT_NAME": project},
+    )
+    template = directory / "env"
+    if configured.returncode != 0 and template.is_file() and not (directory / ".env").exists():
+        shutil.copyfile(template, directory / ".env")
+        configured = run_host(
+            command,
+            cwd=directory,
+            timeout=300,
+            env={"COMPOSE_PROJECT_NAME": project},
+        )
+    if configured.returncode != 0:
+        raise RuntimeError(
+            f"Unable to read the compose file of {directory}: {configured.stderr.strip()}"
+        )
+    return dict(json.loads(configured.stdout)["services"])
+
+
+def compose_ports(directory: Path, project: str) -> list[tuple[str, int, int, str]]:
+    """(service, published, target, protocol) of the stack of `directory`.
+
+    The scripts of a service system address its stack at `localhost:<published
+    port>`; the grading container forwards those ports to the services instead.
+    """
+    ports: list[tuple[str, int, int, str]] = []
+    for service, definition in compose_definition(directory, project).items():
+        for entry in definition.get("ports") or []:
+            published = str(entry.get("published") or "")
+            if not published:
+                # a bare `ports: ["8000"]` takes a random host port, and the
+                # scripts cannot know it either
+                continue
+            ports.append(
+                (
+                    service,
+                    int(published),
+                    int(entry["target"]),
+                    entry.get("protocol") or "tcp",
+                )
+            )
+    return ports
+
+
+@dataclass(frozen=True)
+class StackBuild:
+    """A service whose image is built from the task directory.
+
+    `code_dir` is the directory of the image that holds the codebase, `None` for
+    a service of the stack that does not carry it (a database, a queue).
+    """
+
+    code_dir: str | None
+    image: str
+    context: Path
+    dockerfile: Path
+
+
+def codebase_install_path(dockerfile: Path) -> str | None:
+    """Directory inside the image that the codebase is copied to, if any.
+
+    A service that installs the codebase from a copy (`COPY ./codebase
+    /codebase`) reads that copy at run time, so the copy can be replaced by a
+    mount of the workspace instead of rebuilding the image.
+    """
+    workdir = "/"
+    found: str | None = None
+    for line in dockerfile.read_text().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        instruction = parts[0].upper()
+        if instruction == "WORKDIR":
+            workdir = _image_path(workdir, parts[-1])
+        elif instruction in ("COPY", "ADD"):
+            arguments = [part for part in parts[1:] if not part.startswith("--")]
+            sources, destination = arguments[:-1], arguments[-1]
+            if not any(Path(source).as_posix().lstrip("./") == "codebase" for source in sources):
+                continue
+            found = _image_path(workdir, destination)
+    return found
+
+
+def _image_path(workdir: str, path: str) -> str:
+    if not path.startswith("/"):
+        path = f"{workdir.rstrip('/')}/{path}"
+    return os.path.normpath(path)
+
+
 class Workspace:
     """Host side working copy for one sample.
 
@@ -427,6 +830,14 @@ class Workspace:
         self.spec = spec
         self.root = root
         self.containers: list[str] = []
+        self.grader_container: str | None = None
+        self.forwarder_written = False
+        self.forwarded: dict[int, tuple[str, int]] = {}
+        self.connected_networks: set[str] = set()
+        self._overrides: dict[str, Path | None] = {}
+        self._ports: dict[str, list[tuple[str, int, int, str]]] = {}
+        self._build_services: dict[str, dict[str, StackBuild]] = {}
+        self._stack_lock = threading.Lock()
 
     @classmethod
     def create(cls, spec: BountySpec, cache_dir: Path = WORKSPACES_DIR) -> "Workspace":
@@ -463,6 +874,33 @@ class Workspace:
         return self.bounty_dir / "exploit_files"
 
     @property
+    def image(self) -> str:
+        """Image the sample's own scripts run in (it also carries the wheelhouse)."""
+        return sample_image_tag(self.spec)
+
+    @property
+    def compose_project(self) -> str:
+        """Compose project name of this workspace.
+
+        The scripts derive it from their working directory, which would give the
+        `setup_files` directory of every sample the same name. Naming the project
+        after the workspace keeps concurrent samples of the same system apart and
+        lets the stack be found by label.
+        """
+        return re.sub(r"[^a-z0-9]+", "-", f"bb-{self.root.name}".lower()).strip("-")
+
+    def compose_root(self, directory: Path) -> Path:
+        """Directory whose compose file a script of `directory` ends up using.
+
+        `docker compose` walks up from the working directory, so a script that
+        runs in the bounty setup directory drives the compose file at the top of
+        the workspace, and needs the overrides that go with it.
+        """
+        if compose_file(directory) is not None:
+            return directory
+        return self.root if compose_file(self.root) is not None else directory
+
+    @property
     def compose_dirs(self) -> list[Path]:
         """Directories of the workspace that hold a docker compose file.
 
@@ -470,12 +908,176 @@ class Workspace:
         bounty setup directory.
         """
         candidates = (self.root, self.bounty_dir / "setup_files")
-        return [
-            path
-            for path in candidates
-            if (path / "docker-compose.yml").exists()
-            or (path / "docker-compose.yaml").exists()
-        ]
+        return [path for path in candidates if compose_file(path) is not None]
+
+    def compose_env(self, directory: Path) -> dict[str, str]:
+        """Environment that keeps `docker compose` inside this workspace.
+
+        The scripts derive the project name from their working directory, which
+        would give the `setup_files` directory of every sample the same name, and
+        they publish the stack's ports on the host, which the grading container
+        reaches through its network instead.
+        """
+        env = {"COMPOSE_PROJECT_NAME": self.compose_project}
+        directory = self.compose_root(directory)
+        base = compose_file(directory)
+        if base is None:
+            return env
+        override = self.compose_override(directory)
+        if override is not None:
+            env["COMPOSE_FILE"] = f"{base.resolve()}:{override}"
+        return env
+
+    def compose_override(self, directory: Path) -> Path | None:
+        """Compose file that keeps the stack off the host's ports.
+
+        Written outside the workspace so that it never reaches the agent or the
+        graded tree. Nothing needs the published ports: the scripts are served by
+        the forwarders of the grading container, the agent uses the service names
+        of `shared_net`, so publishing would only cost free host ports and make
+        two samples of the same system collide.
+        """
+        key = str(directory)
+        ports = self.compose_ports(directory)
+        services = sorted({service for service, _, _, _ in ports})
+        entries = {service: ["    ports: !reset []\n"] for service in services} if ports else {}
+        for service, build in sorted(self.build_services(directory).items()):
+            entry = entries.setdefault(service, [])
+            # `build_stack_images` has built the image on the host, where buildx
+            # exists; the scripts never build again, so a changed workspace costs
+            # a copy instead of reinstalling the dependencies.
+            entry.append("    build: !reset null\n")
+            entry.append(f"    image: {build.image}\n")
+        if not entries:
+            self._overrides[key] = None
+            return None
+        name = self.spec.sample_id
+        if directory != self.root:
+            name = f"{name}-{directory.name}"
+        path = COMPOSE_OVERRIDES_DIR / f"{name}.yml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# Generated by concordia_evals.bountybench: the target stack is reached\n"
+            "# through its docker network, so it does not bind the host's ports. The\n"
+            "# image is always built from the vulnerable checkout, and the code under\n"
+            "# test is copied into the container, so a patched workspace reuses the\n"
+            "# image instead of reinstalling the dependencies.\n"
+            "services:\n"
+            + "".join(
+                f"  {service}:\n" + "".join(lines) for service, lines in sorted(entries.items())
+            )
+        )
+        self._overrides[key] = path
+        return path
+
+    def build_services(self, directory: Path) -> dict[str, StackBuild]:
+        """Services that build the codebase into their image, with its path.
+
+        Those images can run the workspace's code from a mount at that path, so
+        a changed codebase does not have to be rebuilt (which would reinstall
+        the dependencies, i.e. download packages while the evaluation runs).
+        Services whose image cannot be mapped that way are left alone.
+        """
+        key = str(directory)
+        if key in self._build_services:
+            return self._build_services[key]
+        directory = self.compose_root(directory)
+        if compose_file(directory) is None:
+            return {}
+        services: dict[str, StackBuild] = {}
+        for service, definition in compose_definition(directory, self.compose_project).items():
+            build = definition.get("build")
+            if not isinstance(build, dict):
+                continue
+            # `docker compose config` resolves the context but keeps the
+            # Dockerfile path as written in the compose file.
+            context = Path(str(build.get("context") or "."))
+            dockerfile = Path(str(build.get("dockerfile") or "Dockerfile"))
+            if not dockerfile.is_absolute():
+                dockerfile = context / dockerfile
+            if not dockerfile.exists():
+                continue
+            code_dir = codebase_install_path(dockerfile)
+            image = str(definition.get("image") or stack_image_tag(self.spec, service))
+            services[service] = StackBuild(
+                code_dir=code_dir, image=image, context=context, dockerfile=dockerfile
+            )
+        self._build_services[key] = services
+        return services
+
+    def build_stack_images(self) -> None:
+        """Build the images of the stack from the vulnerable checkout.
+
+        Built on the host: the grading container has no buildx plugin, so a build
+        that `docker compose` starts from there fails. The image is built once per
+        sample and reused by every stage.
+        """
+        for service, build in sorted(self.build_services(self.root).items()):
+            pristine = self.pristine_context()
+            dockerfile = _map_to_pristine(build.dockerfile, self.root, pristine)
+            stamp_path = COMPOSE_IMAGE_DIR / f"{self.spec.sample_id}-{service}.dockerfile"
+            recipe = dockerfile.read_text()
+            if image_exists(build.image) and stamp_path.exists():
+                if stamp_path.read_text() == recipe:
+                    continue
+            pull_base_images(build.dockerfile)
+            logger.info(f"Building the image of {service} of {self.spec.sample_id}")
+            built = run_host(
+                [
+                    "docker",
+                    "build",
+                    "--tag",
+                    build.image,
+                    "--file",
+                    str(_map_to_pristine(build.dockerfile, self.root, pristine)),
+                    str(_map_to_pristine(build.context, self.root, pristine)),
+                ],
+                timeout=STACK_BUILD_TIMEOUT,
+            )
+            if built.returncode != 0:
+                raise RuntimeError(
+                    f"Unable to build the image of {service} of {self.spec.sample_id}: "
+                    f"{built.stderr.strip()[-2_000:]}"
+                )
+            stamp_path.parent.mkdir(parents=True, exist_ok=True)
+            stamp_path.write_text(recipe)
+
+    def pristine_context(self) -> Path:
+        """Build context of the stack image: the checkout at the vulnerable commit.
+
+        Taken from the cache mirror instead of the workspace so that it stays the
+        same whatever the agent (or the grading) does to the workspace: the build
+        is then always a cache hit, and the code under test reaches the container
+        through the mount above.
+        """
+        path = COMPOSE_BUILD_DIR / self.spec.sample_id
+        ready = path / ".ready"
+        # The context is the copy with the build adaptations of the workspace
+        # applied, so it is only reusable while those did not change.
+        signature = build_adaptation_signature(BUILD_FIXES.get(self.spec.system))
+        if ready.exists() and ready.read_text().strip() == signature:
+            return path
+        shutil.rmtree(path, ignore_errors=True)
+        shutil.copytree(
+            self.root,
+            path,
+            ignore=shutil.ignore_patterns("codebase", "agent_workspace"),
+        )
+        clone_codebase(
+            ensure_codebase_mirror(self.spec),
+            self.spec.vulnerable_commit,
+            path / "codebase",
+        )
+        ready.write_text(signature + "\n")
+        logger.info(f"Prepared the build context of {self.spec.sample_id} in {path}")
+        return path
+
+    def compose_ports(self, directory: Path) -> list[tuple[str, int, int, str]]:
+        """Cached `compose_ports` of the compose file in `directory`."""
+        key = str(directory)
+        if key not in self._ports:
+            self._ports[key] = compose_ports(directory, self.compose_project)
+        return self._ports[key]
 
     def prepare(self) -> None:
         """Copy system files and check out the codebase at the vulnerable commit."""
@@ -487,10 +1089,20 @@ class Workspace:
         )
         # Keep only the graded bounty so that sibling reports do not leak into
         # the workspace and invariant scripts cannot pick up the wrong bounty.
+        # The directory layout stays: some setup scripts write into a sibling
+        # bounty whatever the sample (`LibreChat` saves a file id in bounty_3).
         bounties_dir = self.root / "bounties"
         for sibling in bounties_dir.iterdir():
-            if sibling.name != f"bounty_{self.spec.bounty_number}":
-                shutil.rmtree(sibling, ignore_errors=True)
+            if sibling.name == f"bounty_{self.spec.bounty_number}":
+                continue
+            for child in list(sibling.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+            (sibling / "verify_files").mkdir()
+        pin_build_mirrors(self.root, fix=BUILD_FIXES.get(self.spec.system))
+        pin_build_context(self.root)
         clone_codebase(
             ensure_codebase_mirror(self.spec),
             self.spec.vulnerable_commit,
@@ -504,30 +1116,104 @@ class Workspace:
         Upstream binds a bounty setup resource for `exploit`/`patch` phases only;
         `detect` runs with the repository setup alone.
         """
+        self.build_stack_images()
         self._run_setup_script(self.root, "setup_repo_env.sh")
         if bounty_setup:
-            self._run_setup_script(
-                self.bounty_dir / "setup_files", "setup_bounty_env.sh"
+            self._run_setup_script(self.bounty_dir / "setup_files", "setup_bounty_env.sh")
+        self.apply_code()
+
+    # ------------------------------------------------------------ code under test
+    def apply_code(self) -> None:
+        """Give the running stack the workspace's code.
+
+        The image of the stack is built from the vulnerable checkout and carries
+        the installed dependencies; the code under test is copied over it and the
+        service restarted. A changed codebase therefore costs a copy instead of a
+        rebuild, which would reinstall the dependencies, i.e. download packages
+        while the evaluation runs.
+        """
+        services = self.build_services(self.root)
+        if not services:
+            return
+        stamp = self.code_stamp()
+        restarted = False
+        for service, build in sorted(services.items()):
+            if build.code_dir is None:
+                continue
+            container = self._service_container(service)
+            if container is None or self._container_stamp(container) == stamp:
+                continue
+            copied = run_host(
+                ["docker", "cp", f"{self.codebase}/.", f"{container}:{build.code_dir}"],
+                timeout=600,
             )
-        self.wait_until_healthy()
+            if copied.returncode != 0:
+                raise RuntimeError(
+                    f"Unable to copy the codebase into {container}: {copied.stderr.strip()}"
+                )
+            restart = run_host(["docker", "restart", container], timeout=900)
+            if restart.returncode != 0:
+                raise RuntimeError(f"Unable to restart {container}: {restart.stderr.strip()}")
+            self._write_container_stamp(container, stamp)
+            restarted = True
+            logger.info(f"Copied the codebase of {self.spec.sample_id} into {container}")
+        if restarted:
+            self.wait_until_healthy()
+
+    def code_stamp(self) -> str:
+        """Revision of the working copy, as handed to the stack."""
+        head = run_host(["git", "rev-parse", "HEAD"], cwd=self.codebase).stdout.strip()
+        changes = run_host(["git", "status", "--porcelain"], cwd=self.codebase).stdout
+        diff = run_host(["git", "diff", "HEAD"], cwd=self.codebase).stdout
+        return hashlib.sha256(f"{head}\n{changes}\n{diff}".encode()).hexdigest()[:16]
+
+    def _service_container(self, service: str) -> str | None:
+        """Running container of one compose service of this workspace."""
+        listed = run_host(
+            [
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"label=com.docker.compose.project={self.compose_project}",
+                "--filter",
+                f"label=com.docker.compose.service={service}",
+            ]
+        )
+        names = listed.stdout.split()
+        return names[0] if names else None
+
+    def _container_stamp(self, container: str) -> str:
+        read = run_host(["docker", "exec", container, "cat", CODE_STAMP_PATH])
+        return read.stdout.strip() if read.returncode == 0 else ""
+
+    def _write_container_stamp(self, container: str, stamp: str) -> None:
+        run_host(
+            [
+                "docker",
+                "exec",
+                container,
+                "sh",
+                "-c",
+                f"echo {stamp} > {CODE_STAMP_PATH}",
+            ]
+        )
 
     def _run_setup_script(self, directory: Path, script: str) -> None:
         script_path = directory / script
         if not script_path.exists():
             return
-        result = run_host(["bash", script], cwd=directory, timeout=3_600)
+        result = self.run_script(directory, script, timeout=3_600)
         logger.debug("%s output:\n%s\n%s", script, result.stdout, result.stderr)
         if result.returncode != 0:
             raise RuntimeError(
-                f"{script} failed with exit code {result.returncode}: "
-                f"{result.stderr.strip()}"
+                f"{script} failed with exit code {result.returncode}: {result.stderr.strip()}"
             )
         if not result.stdout:
             return
         output = result.stdout + result.stderr
-        for name in sorted(
-            {match.group(1) for match in CONTAINER_PATTERN.finditer(output)}
-        ):
+        for name in sorted({match.group(1) for match in CONTAINER_PATTERN.finditer(output)}):
             if name not in self.containers:
                 self.containers.append(name)
 
@@ -546,33 +1232,57 @@ class Workspace:
         start = time.time()
         while pending:
             name = pending[0]
-            status = _container_health(name)
-            if status == "healthy":
+            exists, state, health = _container_health(name)
+            if health == "healthy":
                 pending.pop(0)
-            elif status != "starting":
-                raise RuntimeError(
-                    f"Container '{name}' has unexpected health status: {status}"
-                )
+            elif not exists or state in ("created", "restarting"):
+                # recreated by a setup script, or restarted after the code under
+                # test was copied in: wait for it to come back
+                pass
+            elif health == "":
+                # no healthcheck: the container itself is the only signal
+                if state == "running":
+                    pending.pop(0)
+                else:
+                    raise RuntimeError(f"Container '{name}' is not running: {state}")
+            elif health != "starting":
+                raise RuntimeError(f"Container '{name}' has unexpected health status: {health}")
             if time.time() - start > timeout:
-                raise TimeoutError(
-                    f"Not all containers became healthy within {timeout} seconds"
-                )
+                raise TimeoutError(f"Not all containers became healthy within {timeout} seconds")
             time.sleep(check_interval)
 
     def stop(self) -> None:
-        """Tear down the target stack and remove the working copy."""
+        """Tear down the target stack and remove the working copy.
+
+        The image of the stack is kept: it is named after the sample and carries
+        the installed dependencies, so the next run of the sample starts without
+        building (and therefore without downloading) anything.
+        """
         _LIVE_WORKSPACES.pop(str(self.root), None)
+        self._stop_grader_container()
         if self.root.exists():
             for directory in self.compose_dirs:
                 run_host(
-                    ["docker", "compose", "down", "-v"], cwd=directory, timeout=900
+                    ["docker", "compose", "down", "-v"],
+                    cwd=directory,
+                    timeout=900,
+                    env=self.compose_env(directory),
                 )
         shutil.rmtree(self.root, ignore_errors=True)
 
     def restart(self, bounty_setup: bool = True) -> None:
         """Restart the target system after the codebase changed."""
         for directory in self.compose_dirs:
-            run_host(["docker", "compose", "down", "-v"], cwd=directory, timeout=900)
+            run_host(
+                ["docker", "compose", "down", "-v"],
+                cwd=directory,
+                timeout=900,
+                env=self.compose_env(directory),
+            )
+        # `down` removed the containers, so the health of the previous stack says
+        # nothing about the next one; the forwarders resolve the service names
+        # again on every connection and keep working.
+        self.containers.clear()
         self.start(bounty_setup=bounty_setup)
 
     # --------------------------------------------------------------- codebase
@@ -584,9 +1294,7 @@ class Workspace:
         for args in (["checkout", "--force", commit], ["clean", "-fdq"]):
             result = run_host(["git", *args], cwd=self.codebase)
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"git {' '.join(args)} failed: {result.stderr.strip()}"
-                )
+                raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
 
     def copy_patch_file(self, source: Path, destination: Path) -> None:
         """Copy one file of a reference patch into the working copy.
@@ -600,9 +1308,7 @@ class Workspace:
         shutil.copyfile(source, destination)
         run_host(["git", "add", str(destination)], cwd=self.codebase)
 
-    def run_git(
-        self, args: list[str], cwd: Path | None = None
-    ) -> subprocess.CompletedProcess[str]:
+    def run_git(self, args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         """Run git in the workspace."""
         return run_host(["git", *args], cwd=cwd or self.root)
 
@@ -632,8 +1338,34 @@ class Workspace:
     def run_script(
         self, directory: Path, script: str, timeout: int | None = None
     ) -> ExecResult[str]:
-        """Run one of the task's shell scripts on the host."""
-        result = run_host(["bash", script], cwd=directory, timeout=timeout)
+        """Run one of the task's shell scripts in the grading container."""
+        self.apply_code()
+        container = self._ensure_grader_container()
+        self._expose_stack(container)
+        stop = threading.Event()
+        sync = threading.Thread(target=self._sync_stack, args=(container, stop), daemon=True)
+        sync.start()
+        try:
+            environment: list[str] = []
+            for name, value in self.compose_env(directory).items():
+                environment += ["--env", f"{name}={value}"]
+            result = run_host(
+                [
+                    "docker",
+                    "exec",
+                    *environment,
+                    "-w",
+                    str(directory),
+                    container,
+                    "bash",
+                    script,
+                ],
+                timeout=timeout,
+            )
+        finally:
+            stop.set()
+            sync.join(timeout=60)
+            self._restore_ownership()
         return ExecResult(
             success=result.returncode == 0,
             returncode=result.returncode,
@@ -641,44 +1373,370 @@ class Workspace:
             stderr=result.stderr,
         )
 
+    def _ensure_grader_container(self) -> str:
+        """Start (once) the container the sample's own scripts run in.
 
-def run_container_script(
-    workspace_root: Path,
-    work_dir: str,
-    script: str = "exploit.sh",
-    image: str = AGENT_IMAGE,
-    network: str = SHARED_NETWORK,
-    timeout: int = 900,
-) -> ExecResult[str]:
-    """Run a task script in a container with the workspace mounted at `/app`.
+        The scripts drive `docker compose` and `docker exec` against the target
+        stack, so the container gets the docker socket and the workspace mounted
+        at its host path, which keeps the relative paths of the scripts the same
+        as upstream's. The stack itself is reached through `_expose_stack`.
+        """
+        if self.grader_container is not None:
+            return self.grader_container
+        name = f"{GRADER_CONTAINER_PREFIX}{self.root.name}"
+        # a container left behind by an interrupted run still holds the workspace
+        run_host(["docker", "rm", "--force", name])
+        # the compose override and the build context live outside the workspace,
+        # which keeps them away from the agent and the graded tree; the scripts
+        # have to see both
+        COMPOSE_OVERRIDES_DIR.mkdir(parents=True, exist_ok=True)
+        COMPOSE_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        result = run_host(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--volume",
+                f"{self.root}:{self.root}",
+                "--volume",
+                f"{COMPOSE_OVERRIDES_DIR}:{COMPOSE_OVERRIDES_DIR}",
+                "--volume",
+                f"{COMPOSE_BUILD_DIR}:{COMPOSE_BUILD_DIR}:ro",
+                "--volume",
+                f"{DOCKER_SOCKET}:{DOCKER_SOCKET}",
+                "--env",
+                "PIP_NO_INDEX=1",
+                "--env",
+                f"PIP_FIND_LINKS={SANDBOX_WHEELHOUSE}",
+                "--env",
+                "PIP_DISABLE_PIP_VERSION_CHECK=1",
+                self.image,
+                "tail",
+                "-f",
+                "/dev/null",
+            ],
+            timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Unable to start the grading container of {self.spec.sample_id}: "
+                f"{result.stderr.strip()}"
+            )
+        self.grader_container = name
+        return name
 
-    Upstream runs the reference exploits this way (`docker run
-    cybench/bountyagent`), so files they write land in the task directory on the
-    host and the host side `verify.sh` can see them.
+    def _sync_stack(self, container: str, stop: threading.Event) -> None:
+        """Keep the view of the stack current while one of the scripts runs."""
+        while not stop.wait(STACK_SYNC_INTERVAL):
+            try:
+                self._expose_stack(container)
+            except Exception:
+                logger.exception("Unable to expose the target stack")
+
+    def _expose_stack(self, container: str) -> None:
+        """Give the scripts the target stack the way they expect it.
+
+        They reach the target containers by name on the compose network and talk
+        to their published ports on `localhost`, so the grading container joins
+        the networks of the stack and forwards those ports to the services.
+        """
+        with self._stack_lock:
+            self._expose_stack_once(container)
+
+    def _expose_stack_once(self, container: str) -> None:
+        for directory in self.compose_dirs:
+            for service, published, target, protocol in self.compose_ports(directory):
+                self._forward(container, service, published, target, protocol)
+        listed = run_host(
+            [
+                "docker",
+                "ps",
+                "--quiet",
+                "--filter",
+                f"label=com.docker.compose.project={self.compose_project}",
+            ],
+            timeout=120,
+        )
+        containers = listed.stdout.split()
+        if not containers:
+            return
+        inspected = run_host(
+            ["docker", "inspect", "--format", "{{json .}}", *containers], timeout=300
+        )
+        for line in inspected.stdout.splitlines():
+            networks = json.loads(line)["NetworkSettings"]["Networks"]
+            for network in networks:
+                if network in self.connected_networks:
+                    continue
+                attached = run_host(
+                    ["docker", "network", "connect", network, container], timeout=120
+                )
+                if attached.returncode != 0:
+                    raise RuntimeError(
+                        f"Unable to attach the grading container to {network}: "
+                        f"{attached.stderr.strip()}"
+                    )
+                self.connected_networks.add(network)
+
+    def _forward(
+        self, container: str, service: str, published: int, target: int, protocol: str
+    ) -> None:
+        """Serve one published port of the stack on the loopback of the container."""
+        if protocol != "tcp":
+            logger.warning(
+                "Not forwarding %s/%s of %s: only tcp is forwarded",
+                published,
+                protocol,
+                service,
+            )
+            return
+        if published in self.forwarded:
+            return
+        if not self.forwarder_written:
+            written = run_host(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "bash",
+                    "-c",
+                    f"cat > {FORWARDER_PATH} <<'PY'\n{FORWARDER_SCRIPT}PY\n",
+                ],
+                timeout=120,
+            )
+            if written.returncode != 0:
+                raise RuntimeError(
+                    f"Unable to install the forwarder in the grading container: "
+                    f"{written.stderr.strip()}"
+                )
+            self.forwarder_written = True
+        started = run_host(
+            [
+                "docker",
+                "exec",
+                "--detach",
+                container,
+                "python3",
+                FORWARDER_PATH,
+                str(published),
+                service,
+                str(target),
+            ],
+            timeout=120,
+        )
+        if started.returncode != 0:
+            raise RuntimeError(
+                f"Unable to forward localhost:{published} to {service}:{target}: "
+                f"{started.stderr.strip()}"
+            )
+        self.forwarded[published] = (service, target)
+
+    def _restore_ownership(self) -> None:
+        """Hand the files the scripts wrote back to the evaluator user.
+
+        The scripts run as root (some of them install system packages) while the
+        working copy belongs to the evaluator, whose later git commands must keep
+        working.
+        """
+        if self.grader_container is None:
+            return
+        result = run_host(
+            [
+                "docker",
+                "exec",
+                self.grader_container,
+                "chown",
+                "-R",
+                f"{os.getuid()}:{os.getgid()}",
+                str(self.root),
+            ],
+            timeout=900,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to hand %s back to the evaluator user: %s",
+                self.root,
+                result.stderr.strip(),
+            )
+
+    def _stop_grader_container(self) -> None:
+        if self.grader_container is None:
+            return
+        run_host(["docker", "rm", "--force", self.grader_container], timeout=300)
+        self.grader_container = None
+        self.forwarder_written = False
+        self.forwarded.clear()
+        self.connected_networks.clear()
+
+
+@dataclass(frozen=True)
+class BuildFix:
+    """Adaptations for a bounty whose own `Dockerfile` no longer builds.
+
+    `constraints` pin a package that the Dockerfile installs unpinned and whose
+    current release broke it; `hosts` replace a package host that stopped serving
+    the distribution the sample pins (a distro that reached end of life).
+    `apt_conf` is written to the image before its first `apt-get update`, for the
+    package manager options those replacements need.
     """
-    result = run_host(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            network,
-            "-v",
-            f"{workspace_root}:/app",
-            "-w",
-            f"/app/{work_dir}",
-            image,
-            "bash",
-            script,
-        ],
-        timeout=timeout,
+
+    constraints: tuple[str, ...] = ()
+    hosts: tuple[tuple[str, str], ...] = ()
+    apt_hosts: tuple[tuple[str, str], ...] = ()
+    # (substring of a RUN line) -> refresh the package lists before that line:
+    # the base image bakes lists that name versions no mirror serves any more
+    apt_update_before: tuple[str, ...] = ()
+    apt_conf: tuple[str, ...] = ()
+    # the archive the sample now installs from forces https, and the base image
+    # of some bounties ships no CA certificates
+    apt_ca_certificates: bool = False
+
+
+BUILD_CONSTRAINTS_PATH = "/opt/build-constraints.txt"
+APT_CONF_PATH = "/etc/apt/apt.conf.d/99build-fix"
+
+# The Debian archive keeps every package it ever served, at the day it served it:
+# the versions the base images of the samples name are still there, which is what
+# makes an image built against a package that was superseded buildable again.
+SECURITY_ARCHIVE = "http://snapshot.debian.org/archive/debian-security/20260201T000000Z"
+
+# Only for the samples that do not build against today's package indexes. The
+# datasets' `Dockerfile`s are unchanged upstream, so they resolve to the current
+# release of an unpinned dependency (or to a repository that has been dropped),
+# and the image of the target stack cannot be built at all.
+BUILD_FIXES: dict[str, BuildFix] = {
+    "gradio": BuildFix(constraints=("huggingface_hub<0.30",)),
+    "pytorch-lightning": BuildFix(constraints=("setuptools<81",)),
+    # `lunary` builds its database image from `postgres:15-bullseye`: that image
+    # bakes package lists naming `bullseye-security` versions Debian has since
+    # removed from its pool, and `bullseye-pgdg` moved to the archive (the
+    # `groonga` source package writes that repository into the image itself)
+    "lunary": BuildFix(
+        hosts=(("apt.postgresql.org", "apt-archive.postgresql.org"),),
+        apt_hosts=(
+            ("apt.postgresql.org", "apt-archive.postgresql.org"),
+            ("http://security.debian.org/debian-security", SECURITY_ARCHIVE),
+        ),
+        apt_conf=(
+            # the archive serves the state of that day, so its `Release` file is
+            # always older than the validity window Debian gave it
+            'Acquire::Check-Valid-Until "false";',
+            # the archive is far away and slow: a single dropped connection
+            # would otherwise fail the whole build
+            'Acquire::Retries "5";',
+            'Acquire::http::Timeout "60";',
+        ),
+        apt_ca_certificates=True,
+        apt_update_before=("apt install",),
+    ),
+}
+
+
+def _apt_host_rewrite(hosts: tuple[tuple[str, str], ...]) -> str | None:
+    """Dockerfile line that replaces package hosts in the sources of the image."""
+    if not hosts:
+        return None
+    expressions = "; ".join(f"s#{old}#{new}#g" for old, new in hosts)
+    return (
+        "RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do "
+        '[ -f "$f" ] || continue; '
+        f"sed -i -E '{expressions}' \"$f\"; done"
     )
-    return ExecResult(
-        success=result.returncode == 0,
-        returncode=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
-    )
+
+
+def build_adaptation_signature(fix: BuildFix | None) -> str:
+    """Fingerprint of the build adaptations, to tell a reusable context from a stale one."""
+    settings = [
+        PIP_INDEX_URL,
+        APT_MIRROR_URL,
+        APT_MIRROR_SCRIPT,
+        NPM_REGISTRY_URL,
+        NODE_HEADERS_DIR,
+        APT_CONF_PATH,
+        repr(fix),
+    ]
+    return hashlib.sha256("\n".join(settings).encode()).hexdigest()[:16]
+
+
+def pin_build_mirrors(
+    directory: Path,
+    index_url: str = PIP_INDEX_URL,
+    apt_script: str = APT_MIRROR_SCRIPT,
+    fix: BuildFix | None = None,
+) -> None:
+    """Point the package managers of the bounties' Dockerfiles at local mirrors.
+
+    They install from the public PyPI and the distro mirrors, which are slow
+    enough from some networks to push a single target build into tens of minutes
+    (and every code change rebuilds those layers). Only the workspace copy is
+    rewritten; the dataset stays untouched.
+    """
+    pins: list[str] = []
+    if fix is not None and fix.constraints:
+        pins.append(f"ENV PIP_CONSTRAINT={BUILD_CONSTRAINTS_PATH}")
+        pinned = " ".join(f'"{line}"' for line in fix.constraints)
+        pins.append(f"RUN printf '%s\\n' {pinned} > {BUILD_CONSTRAINTS_PATH}")
+    if fix is not None and fix.apt_conf:
+        configured = " ".join(f"'{line}'" for line in fix.apt_conf)
+        pins.append(f"RUN printf '%s\\n' {configured} > {APT_CONF_PATH}")
+    for dockerfile in sorted(directory.rglob("Dockerfile*")):
+        if not dockerfile.is_file():
+            continue
+        if dockerfile.relative_to(directory).parts[0] == "codebase":
+            # the code under test keeps its own build files
+            continue
+        text = dockerfile.read_text()
+        for host, replacement in fix.hosts if fix is not None else ():
+            text = text.replace(host, replacement)
+        apt_rewrite = _apt_host_rewrite(fix.apt_hosts if fix is not None else ())
+        trailing_pins: list[str] = []
+        if fix is not None and fix.apt_ca_certificates:
+            # the image may ship a repository that is already gone, so the
+            # rewrite has to come before this update as well
+            rewritten_update = (
+                f"{apt_rewrite.removeprefix('RUN ')} && " if apt_rewrite is not None else ""
+            )
+            trailing_pins.append(
+                f"RUN {rewritten_update}apt-get update && apt-get install -y ca-certificates"
+            )
+        lines = text.splitlines()
+        rewritten: list[str] = []
+        for line in lines:
+            if apt_rewrite is not None and "apt-get update" in line:
+                # a package of the image installs a repository of its own
+                rewritten.append(apt_rewrite)
+            if (
+                fix is not None
+                and "apt-get update" not in line
+                and any(needle in line for needle in fix.apt_update_before)
+            ):
+                rewritten.append("RUN apt-get update")
+            rewritten.append(line)
+            if line.strip().upper().startswith("FROM "):
+                rewritten.extend(pins)
+                rewritten.append(f"ENV PIP_INDEX_URL={index_url}")
+                rewritten.append(f"ENV npm_config_registry={NPM_REGISTRY_URL}")
+                rewritten.append(f"ENV npm_config_nodedir={NODE_HEADERS_DIR}")
+                rewritten.append(f"RUN {apt_script}")
+                rewritten.extend(trailing_pins)
+        rewritten_text = "\n".join(rewritten) + "\n"
+        if rewritten_text != dockerfile.read_text():
+            dockerfile.write_text(rewritten_text)
+
+
+# Files of a fresh checkout that differ between two clones of the same commit
+# (the index records modification times, the reflog records when the clone ran).
+# They are part of the build context, so without this every workspace would miss
+# the build cache and re-run the dependency install, which downloads packages
+# during the evaluation.
+BUILD_CONTEXT_VOLATILE = ("codebase/.git/index", "codebase/.git/logs", "agent_workspace")
+
+
+def pin_build_context(directory: Path) -> None:
+    """Keep the volatile checkout files out of the build context."""
+    (directory / ".dockerignore").write_text("\n".join(BUILD_CONTEXT_VOLATILE) + "\n")
 
 
 def clone_codebase(mirror: Path, commit: str, destination: Path) -> None:
@@ -688,19 +1746,29 @@ def clone_codebase(mirror: Path, commit: str, destination: Path) -> None:
     clone = run_host(["git", "clone", "--quiet", str(mirror), str(destination)])
     if clone.returncode != 0:
         raise RuntimeError(f"git clone failed: {clone.stderr.strip()}")
-    checkout = run_host(
-        ["git", "checkout", "--quiet", "--force", commit], cwd=destination
-    )
+    checkout = run_host(["git", "checkout", "--quiet", "--force", commit], cwd=destination)
     if checkout.returncode != 0:
         raise RuntimeError(f"git checkout failed: {checkout.stderr.strip()}")
 
 
-def _container_health(name: str) -> str:
-    """Raw health status of a container (empty when it defines no healthcheck)."""
+def _container_health(name: str) -> tuple[bool, str, str]:
+    """(running, state, health) of a container.
+
+    `health` is empty while the container has no healthcheck, and also for a
+    moment after a restart, before the first probe has run.
+    """
     result = run_host(
-        ["docker", "inspect", "--format={{json .State.Health.Status}}", name]
+        [
+            "docker",
+            "inspect",
+            "--format={{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
+            name,
+        ]
     )
-    return result.stdout.strip().strip("'\"").strip()
+    if result.returncode != 0:
+        return False, "", ""
+    state, _, health = result.stdout.strip().partition("|")
+    return True, state, health.strip()
 
 
 # ---------------------------------------------------------------------- sandbox
@@ -732,10 +1800,7 @@ def tree_filter(
         if parts and parts[0] in exclude:
             return None
         relative = Path(*parts).as_posix() if parts else "."
-        if any(
-            relative == path or relative.startswith(f"{path}/")
-            for path in exclude_paths
-        ):
+        if any(relative == path or relative.startswith(f"{path}/") for path in exclude_paths):
             return None
         if skip_hidden and any(part.startswith(".") and part != "." for part in parts):
             return None
@@ -784,9 +1849,7 @@ async def download_tree(
     are never serialised.
     """
     excludes = " ".join(f"--exclude=./{name}" for name in sorted(exclude))
-    result = await sh(
-        sbx, f"tar czf - {excludes} -C {remote_dir} . | base64 -w 0", timeout=600
-    )
+    result = await sh(sbx, f"tar czf - {excludes} -C {remote_dir} . | base64 -w 0", timeout=600)
     if not result.success:
         raise RuntimeError(f"Failed to read {remote_dir}: {result.stderr}")
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -841,8 +1904,7 @@ async def init_sandbox(sbx: SandboxEnvironment, spec: BountySpec) -> None:
             [
                 f"rm -rf {SANDBOX_CODEBASE_DIR}",
                 f"git clone --quiet {SANDBOX_MIRROR_DIR} {SANDBOX_CODEBASE_DIR}",
-                f"git -C {SANDBOX_CODEBASE_DIR} checkout --quiet --force "
-                f"{spec.vulnerable_commit}",
+                f"git -C {SANDBOX_CODEBASE_DIR} checkout --quiet --force {spec.vulnerable_commit}",
             ]
         )
     commands.extend(
@@ -855,9 +1917,7 @@ async def init_sandbox(sbx: SandboxEnvironment, spec: BountySpec) -> None:
     clone = await sh(sbx, " && ".join(commands), timeout=1_800)
     if not clone.success:
         raise RuntimeError(f"Failed to prepare the agent workspace: {clone.stderr}")
-    await upload_tree(
-        sbx, spec.bounty_dir / "verify_files", SANDBOX_VERIFY_DIR, skip_hidden=True
-    )
+    await upload_tree(sbx, spec.bounty_dir / "verify_files", SANDBOX_VERIFY_DIR, skip_hidden=True)
     await sh(sbx, f"chmod -R a+x {SANDBOX_VERIFY_DIR} || true")
     # Upstream tracks the workspace with a git repository (ignoring the codebase)
     # and uses it to drop the side effects of each exploit run.
@@ -926,9 +1986,7 @@ async def sandbox_git_diff(sbx: SandboxEnvironment) -> str:
     binary = {
         parts[2]
         for line in numstat.stdout.splitlines()
-        if (parts := line.split("\t"))
-        and len(parts) == NUMSTAT_FIELDS
-        and parts[0] == "-"
+        if (parts := line.split("\t")) and len(parts) == NUMSTAT_FIELDS and parts[0] == "-"
     }
     pathspecs = " ".join(f":(exclude){path}" for path in sorted(binary))
     diff = await sh(sbx, f"git diff --cached -- {pathspecs}", cwd=SANDBOX_CODEBASE_DIR)

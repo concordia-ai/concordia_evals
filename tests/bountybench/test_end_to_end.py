@@ -310,6 +310,39 @@ def test_end_to_end_comment_only_patch_scores_incorrect() -> None:
     assert score.metadata["verify_exit_code_after_patch"] == 0
 
 
+@solver
+def dependency_change_patch_solver() -> Solver:
+    """Try to "fix" the bounty by pulling in a package instead of editing code."""
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        sbx = sandbox()
+        await sbx.write_file(
+            f"{SANDBOX_CODEBASE_DIR}/requirements.txt", b"requests==2.31.0\n"
+        )
+        store().set(SUBMITTED_STORE_KEY, True)
+        return state
+
+    return solve
+
+
+@pytest.mark.docker
+@pytest.mark.dataset_download
+@pytest.mark.slow(600)
+def test_end_to_end_patch_touching_dependencies_scores_incorrect() -> None:
+    """The environment of a sample is fixed, so such a patch is rejected."""
+    task = bountybench(task_type="patch", bounties="zipp:0")
+    task.solver = [task.solver[0], dependency_change_patch_solver()]  # type: ignore[index]
+
+    [log] = eval(task, model="mockllm/model", limit=1, display="none")
+
+    assert log.status == "success", log.error
+    score = log.samples[0].scores["bountybench_scorer"]  # type: ignore[index]
+    assert score.value == "I", score.explanation
+    assert "which the task forbids" in str(score.explanation)
+    assert score.metadata is not None
+    assert score.metadata["dependency_changes"] == ["requirements.txt"]
+
+
 @pytest.mark.docker
 @pytest.mark.dataset_download
 @pytest.mark.slow(600)

@@ -35,6 +35,7 @@ from concordia_evals.bountybench.constants import (
     SANDBOX_MIRRORS_DIR,
     SANDBOX_WHEELHOUSE,
     SHARED_NETWORK,
+    UNAVAILABLE_SAMPLES,
 )
 from concordia_evals.bountybench.prompts import get_initial_prompt
 from concordia_evals.bountybench.writeup import read_writeup
@@ -142,9 +143,7 @@ def compatible_bounties(bounty_metadata: dict[str, Any]) -> list[str]:
     Upstream renamed the field from `compatible_patches` to `compatible_exploits`
     between task data versions, so both are accepted.
     """
-    values = bounty_metadata.get("compatible_exploits") or bounty_metadata.get(
-        "compatible_patches"
-    )
+    values = bounty_metadata.get("compatible_exploits") or bounty_metadata.get("compatible_patches")
     return [str(item) for item in values or []]
 
 
@@ -175,16 +174,12 @@ def list_bounty_specs(root: Path) -> list[BountySpec]:
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> None:
-    result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
 
 
-def ensure_codebase_mirror(
-    spec: BountySpec, cache_dir: Path = CODEBASE_MIRRORS_DIR
-) -> Path:
+def ensure_codebase_mirror(spec: BountySpec, cache_dir: Path = CODEBASE_MIRRORS_DIR) -> Path:
     """Clone (once per system) the target repository as a bare mirror.
 
     The mirror is mounted read-only into the agent sandbox and is also the
@@ -206,9 +201,7 @@ def ensure_codebase_mirror(
 def system_bounty_commits(spec: BountySpec) -> list[str]:
     """Return the vulnerable commits of every bounty of the system."""
     commits: list[str] = []
-    for metadata_file in sorted(
-        (spec.system_dir / "bounties").glob("*/bounty_metadata.json")
-    ):
+    for metadata_file in sorted((spec.system_dir / "bounties").glob("*/bounty_metadata.json")):
         commit = json.loads(metadata_file.read_text()).get("vulnerable_commit")
         if commit and commit not in commits:
             commits.append(commit)
@@ -217,9 +210,7 @@ def system_bounty_commits(spec: BountySpec) -> list[str]:
     return commits
 
 
-def ensure_sandbox_mirror(
-    spec: BountySpec, cache_dir: Path = SANDBOX_MIRRORS_DIR
-) -> Path:
+def ensure_sandbox_mirror(spec: BountySpec, cache_dir: Path = SANDBOX_MIRRORS_DIR) -> Path:
     """Build the codebase mirror that is mounted into the agent sandbox.
 
     The upstream repositories are full GitHub mirrors: their later commits and
@@ -465,11 +456,21 @@ def get_dataset(
             raise ValueError(f"Unknown bounties: {sorted(missing)}")
         specs = [spec for spec in specs if _bounty_key(spec) in wanted]
 
+    unavailable = UNAVAILABLE_SAMPLES.get(task_type, {})
+    if bounties is not None:
+        refused = [
+            f"{spec.sample_id}: {unavailable[spec.sample_id]}"
+            for spec in specs
+            if spec.sample_id in unavailable
+        ]
+        if refused:
+            raise ValueError(f"Not available for {task_type}: {refused}")
+    specs = [spec for spec in specs if spec.sample_id not in unavailable]
+
     if sample_num is not None:
         if sample_num > len(specs):
             raise ValueError(
-                f"sample_num={sample_num} exceeds the number of available "
-                f"bounties ({len(specs)})"
+                f"sample_num={sample_num} exceeds the number of available bounties ({len(specs)})"
             )
         specs = random.Random(random_seed).sample(specs, sample_num)
         specs.sort(key=lambda spec: spec.sample_id)
