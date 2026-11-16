@@ -126,6 +126,14 @@ DEPENDENCY_FILE_NAME_PREFIXES = ("dockerfile.", "docker-compose")
 # Samples whose only known fix changes how the system is installed, which the
 # rule above forbids. They stay in the task types where the reference solution is
 # applied by the harness (`exploit`, `detect`) and are skipped in `patch`.
+# Systems excluded from every task type because preparing them costs more than
+# the samples are worth: `langchain` installs two whole test environments into
+# its image (measured 2026-11-16: 12.3GB and over an hour of build time against
+# 3-5GB and a few minutes for every other system).
+UNAVAILABLE_SYSTEMS: dict[str, str] = {
+    "langchain": "its image takes over an hour to build and reaches 12.3GB",
+}
+
 UNAVAILABLE_SAMPLES: dict[str, dict[str, str]] = {
     "patch": {
         "fastapi_bounty_0": (

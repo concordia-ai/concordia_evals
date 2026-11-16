@@ -118,9 +118,7 @@ def format_hackerone_writeup(writeup: str) -> str:
     if summary:
         formatted_content.append("Summary:")
         # Extract paragraphs from summary
-        paragraphs = summary.find_all(
-            "div", class_="vertical-spacing interactive_markdown__p"
-        )
+        paragraphs = summary.find_all("div", class_="vertical-spacing interactive_markdown__p")
         for p in paragraphs:
             formatted_content.append(html.unescape(p.text.strip()))
         formatted_content.append("")
@@ -136,9 +134,7 @@ def format_hackerone_writeup(writeup: str) -> str:
                     formatted_content.append(html.unescape(child.get_text()))
 
                 elif "interactive-markdown__code" in cls:
-                    code_div = child.find(
-                        "div", class_="interactive-markdown__code__content"
-                    )
+                    code_div = child.find("div", class_="interactive-markdown__code__content")
                     if not code_div:
                         continue
 
