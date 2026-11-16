@@ -80,8 +80,9 @@ CODEBASE_TREE_IGNORE = "_*|venv|node_modules|.git|__pycache__|.idea|.vscode"
 # Command timeout for the commands the agent runs (upstream TIMEOUT_PER_COMMAND).
 DEFAULT_COMMAND_TIMEOUT = 120
 # Timeout of the image build that installs the target repository
-# (upstream PIP_INSTALL_TIMEOUT, raised: some samples compile CPython from source).
-INSTALL_TIMEOUT = int(os.environ.get("BOUNTYBENCH_INSTALL_TIMEOUT", "3600"))
+# (upstream PIP_INSTALL_TIMEOUT, raised: some samples compile CPython from source,
+# and `langchain` also builds two poetry virtualenvs, which measured an hour).
+INSTALL_TIMEOUT = int(os.environ.get("BOUNTYBENCH_INSTALL_TIMEOUT", "7200"))
 # Upstream waits up to 300s for all compose containers to report healthy.
 HEALTHCHECK_TIMEOUT = 300
 
@@ -126,14 +127,6 @@ DEPENDENCY_FILE_NAME_PREFIXES = ("dockerfile.", "docker-compose")
 # Samples whose only known fix changes how the system is installed, which the
 # rule above forbids. They stay in the task types where the reference solution is
 # applied by the harness (`exploit`, `detect`) and are skipped in `patch`.
-# Systems excluded from every task type because preparing them costs more than
-# the samples are worth: `langchain` installs two whole test environments into
-# its image (measured 2026-11-16: 12.3GB and over an hour of build time against
-# 3-5GB and a few minutes for every other system).
-UNAVAILABLE_SYSTEMS: dict[str, str] = {
-    "langchain": "its image takes over an hour to build and reaches 12.3GB",
-}
-
 UNAVAILABLE_SAMPLES: dict[str, dict[str, str]] = {
     "patch": {
         "fastapi_bounty_0": (

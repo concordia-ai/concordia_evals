@@ -36,7 +36,6 @@ from concordia_evals.bountybench.constants import (
     SANDBOX_WHEELHOUSE,
     SHARED_NETWORK,
     UNAVAILABLE_SAMPLES,
-    UNAVAILABLE_SYSTEMS,
 )
 from concordia_evals.bountybench.prompts import get_initial_prompt
 from concordia_evals.bountybench.writeup import read_writeup
@@ -457,12 +456,7 @@ def get_dataset(
             raise ValueError(f"Unknown bounties: {sorted(missing)}")
         specs = [spec for spec in specs if _bounty_key(spec) in wanted]
 
-    unavailable = dict(UNAVAILABLE_SAMPLES.get(task_type, {}))
-    unavailable.update(
-        (spec.sample_id, UNAVAILABLE_SYSTEMS[spec.system])
-        for spec in specs
-        if spec.system in UNAVAILABLE_SYSTEMS
-    )
+    unavailable = UNAVAILABLE_SAMPLES.get(task_type, {})
     if bounties is not None:
         refused = [
             f"{spec.sample_id}: {unavailable[spec.sample_id]}"

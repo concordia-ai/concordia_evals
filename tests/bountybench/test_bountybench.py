@@ -1012,21 +1012,6 @@ def test_patch_task_skips_the_bounty_whose_fix_changes_dependencies(
         data.get_dataset("patch", bounties="fastapi:0")
 
 
-def test_langchain_is_left_out_of_every_task_type(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Its image takes over an hour and 12GB, so the samples are not offered."""
-    root = _make_bounty_tasks_tree(tmp_path)
-    (root / "demoapp").rename(root / "langchain")
-    monkeypatch.setattr(data, "ensure_bountytasks", lambda _dir: root)
-    monkeypatch.setattr(data, "ensure_sandbox_mirror", lambda spec: tmp_path)
-
-    for task_type in ("detect", "exploit", "patch"):
-        assert data.get_dataset(task_type).samples == []
-    with pytest.raises(ValueError, match="Not available for patch"):
-        data.get_dataset("patch", bounties="langchain:0")
-
-
 def test_build_context_ignores_the_volatile_checkout_files(tmp_path: Path) -> None:
     """Two clones of the same commit must hash the same, or nothing is cached."""
     environment.pin_build_context(tmp_path)
