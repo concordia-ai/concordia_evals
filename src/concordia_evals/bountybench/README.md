@@ -97,13 +97,17 @@ Some invariant suites assume the host environment upstream runs them on, which t
 | system | what the script installs | how the image covers it |
 | --- | --- | --- |
 | `curl`, `vllm` | `apt install -y build-essential cmake …` | `GRADING_TOOLS`: the packages are installed while the image is built, the script's own `apt` call fails harmlessly |
+| `curl` | the suite needs a generated `en_US.UTF-8` locale | `GRADING_SETUP`: `locale-gen` for the locale the tests set |
 | `llama_index`, `scikit-learn` | `python3.10 -m venv` (Kali ships 3.9 and 3.13) | `GRADING_PYTHONS`: `uv python install 3.10`, symlinked to `/usr/local/bin/python3.10`, and the wheelhouse gets a second download pass for 3.10 wheels |
 
 Measured: `gunicorn` reports `215 passed` (its threshold) with the `PATH` prelude; `llama_index` builds its 3.10 virtualenv and installs its test packages from the wheelhouse offline.
 
 `langchain` was the fourth system of that table, and it is excluded instead (`UNAVAILABLE_SYSTEMS`): its grading installs two whole test environments, which measured 12.3GB of image and over an hour of build time against 3-5GB and a few minutes for every other system.
 
-`curl` builds from source in 113s, but its `tests/runtests.pl` aborted before its first test with `Possible precedence problem between ! and string eq at ./runtests.pl line 1632`. The file sets `use warnings FATAL => 'all'`, and the image's Perl 5.42 raises that warning for `!$cmdtype eq "perl"`, so the warning is fatal; `HARNESS_FIXES` rewrites it to `$cmdtype ne "perl"` while the image is built, which makes the fix part of the committed starting state rather than part of the agent's diff.
+`curl` needed three fixes, and its invariant score went from empty to `1379` against a threshold of `1334`:
+
+- `tests/runtests.pl` aborted before its first test with `Possible precedence problem between ! and string eq at ./runtests.pl line 1632`. The file sets `use warnings FATAL => 'all'`, and the image's Perl 5.42 raises that warning for `!$cmdtype eq "perl"`, so the warning is fatal; `HARNESS_FIXES` rewrites it to `$cmdtype ne "perl"` while the image is built, which makes the fix part of the committed starting state rather than part of the agent's diff. On its own this gave `1313` of `1323` tests passing: the ten failures were the IDN tests, which reported `curl: (3) URL using bad/illegal format` and pass once the `en_US.UTF-8` locale they set exists.
+- The threshold counts tests that the suite only runs when it finds the optional protocol libraries and the helper servers the TLS and SOCKS tests drive. `GRADING_TOOLS` installs them for `curl`, which took the reported count from `1324` to `1379`.
 
 Measured on `fastapi_bounty_0` with `PIP_NO_INDEX=1`: stack up in 43s, `run_repo_invariants.sh` returns the same `healthcheck: 1`, `unit_tests: 1636`, `cpu_usage_test: 1` as it does with an index available, and no `MISSING` requirement is reported. Without the two fixes above it silently reported `unit_tests: 0`, because `pytest` could not be installed.
 

@@ -357,7 +357,11 @@ WHEELHOUSE_BASELINE = (
 # that grading needs no package index.
 GRADING_TOOLS: dict[str, tuple[str, ...]] = {
     "mlflow": ("sqlite3",),
-    # `run_repo_invariants.sh` builds the checkout from source
+    # `run_repo_invariants.sh` builds the checkout from source, so it needs the
+    # build tools, and its suite only runs the tests the threshold counts when
+    # the optional protocols are found: LDAP, SASL, GSS-API, HTTP/2 and zstd
+    # libraries, plus the `stunnel` and `sshd` the TLS and SOCKS tests drive
+    # (their score went 1313 -> 1379 against a threshold of 1334).
     "curl": (
         "autoconf",
         "automake",
@@ -367,9 +371,21 @@ GRADING_TOOLS: dict[str, tuple[str, ...]] = {
         "pkg-config",
         "zlib1g-dev",
         "libpsl-dev",
+        "libldap2-dev",
+        "libsasl2-dev",
+        "libkrb5-dev",
+        "libgsasl-dev",
+        "libzstd-dev",
+        "libnghttp2-dev",
+        "libssh2-1-dev",
+        "nghttp2-client",
+        "nghttp2-server",
+        "stunnel4",
+        "openssh-server",
+        "socat",
+        "locales",
     ),
     "vllm": ("git", "build-essential", "cmake", "netcat-openbsd"),
-    "langchain": ("pipx",),
 }
 
 # Interpreters the bounties create their test virtualenvs with. Kali ships 3.9
@@ -381,9 +397,8 @@ SCRIPTS_LOOKUP = (
     """scripts=$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"""
 )
 
-# Installs the sample's own grading needs that only an index can satisfy, done
-# while the image is built; the run stage repeats them offline and finds nothing
-# left to do.
+# Steps the sample's own grading needs that only the build can do, either because
+# they need an index or because they generate state the run stage cannot.
 # Test-harness lines the image's newer Perl rejects. `tests/runtests.pl` sets
 # `use warnings FATAL => 'all'`, so the precedence warning Perl 5.42 raises for
 # `!$x eq "y"` aborts the suite before its first test.
@@ -391,17 +406,13 @@ HARNESS_FIXES: dict[str, tuple[tuple[str, str, str], ...]] = {
     "curl": (("tests/runtests.pl", 'if(!$cmdtype eq "perl")', 'if($cmdtype ne "perl")'),),
 }
 
-GRADING_INSTALLS: dict[str, tuple[str, ...]] = {
-    # `run_repo_invariants.sh` installs poetry with pipx and then `poetry install`
-    "langchain": (
-        "pip install --quiet poetry",
-        "(cd libs/langchain && poetry install --with test)",
-        "(cd libs/community && poetry install --with test)",
-    ),
+GRADING_SETUP: dict[str, tuple[str, ...]] = {
+    # the IDN tests of the suite run under the locale they name, which the image
+    # has to generate or the checks fall back to ASCII
+    "curl": ("sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen",),
 }
 
 GRADING_PYTHONS: dict[str, tuple[str, ...]] = {
-    "langchain": ("3.10",),
     "llama_index": ("3.10",),
     "scikit-learn": ("3.10",),
 }
@@ -739,12 +750,12 @@ RUN cd {SANDBOX_CODEBASE_DIR} && {command} \
         else ""
     )
     grading = "".join(
-        f"""# Part of what the sample's own grading installs, done here because the run
-# stage has no index.
+        f"""# Part of what the sample's own grading expects, done here because the run
+# stage is offline.
 RUN cd {SANDBOX_CODEBASE_DIR} && {step} \
-    || echo "the grading install of {spec.sample_id} failed"
+    || echo "the grading setup of {spec.sample_id} failed"
 """
-        for step in GRADING_INSTALLS.get(spec.system, ())
+        for step in GRADING_SETUP.get(spec.system, ())
     )
     harness = "".join(
         f"""# The image's Perl makes the precedence warning of this line fatal.
