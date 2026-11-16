@@ -548,6 +548,30 @@ def test_sample_recipe_bakes_the_checkout_into_local_task_images(
     assert "COPY wheelhouse.sh /tmp/wheelhouse.sh" in recipe
 
 
+def test_sample_recipe_bakes_the_host_tools_and_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The suites install apt packages and build a 3.10 virtualenv while grading."""
+    monkeypatch.setitem(environment.GRADING_TOOLS, "demoapp", ("sqlite3",))
+    monkeypatch.setitem(environment.GRADING_PYTHONS, "demoapp", ("3.10",))
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    recipe = sample_recipe(spec, None, "#!/bin/bash\n")
+
+    assert "RUN apt-get update && apt-get install -y sqlite3" in recipe
+    assert '"$scripts/uv" python install 3.10' in recipe
+    assert "/usr/local/bin/python3.10" in recipe
+
+
+def test_wheelhouse_covers_the_other_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kali has 3.9 and 3.13, so the 3.10 wheels come from a second download."""
+    script = environment.wheelhouse_script(["pytest"], [], ("3.10",))
+
+    assert "--only-binary=:all: --python-version 3.10" in script
+
+
 def test_sample_recipe_only_mounts_the_checkout_for_service_tasks(
     tmp_path: Path,
 ) -> None:

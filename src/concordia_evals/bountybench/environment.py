@@ -355,7 +355,49 @@ WHEELHOUSE_BASELINE = (
 # Tools the samples' own scripts install on the grading host at run time
 # (`apt-get install sqlite3` in the setup of `mlflow`), baked into the image so
 # that grading needs no package index.
-GRADING_TOOLS: dict[str, tuple[str, ...]] = {"mlflow": ("sqlite3",)}
+GRADING_TOOLS: dict[str, tuple[str, ...]] = {
+    "mlflow": ("sqlite3",),
+    # `run_repo_invariants.sh` builds the checkout from source
+    "curl": (
+        "autoconf",
+        "automake",
+        "build-essential",
+        "libtool",
+        "libssl-dev",
+        "pkg-config",
+        "zlib1g-dev",
+        "libpsl-dev",
+    ),
+    "vllm": ("git", "build-essential", "cmake", "netcat-openbsd"),
+    "langchain": ("pipx",),
+}
+
+# Interpreters the bounties create their test virtualenvs with. Kali ships 3.9
+# and 3.13 only, while these tasks hardcode `python3.10 -m venv`, so the image
+# carries one from `uv`.
+# The image installs console scripts into the interpreter's scripts directory
+# and keeps that directory off `PATH`.
+SCRIPTS_LOOKUP = (
+    """scripts=$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"""
+)
+
+# Installs the sample's own grading needs that only an index can satisfy, done
+# while the image is built; the run stage repeats them offline and finds nothing
+# left to do.
+GRADING_INSTALLS: dict[str, tuple[str, ...]] = {
+    # `run_repo_invariants.sh` installs poetry with pipx and then `poetry install`
+    "langchain": (
+        "pip install --quiet poetry",
+        "(cd libs/langchain && poetry install --with test)",
+        "(cd libs/community && poetry install --with test)",
+    ),
+}
+
+GRADING_PYTHONS: dict[str, tuple[str, ...]] = {
+    "langchain": ("3.10",),
+    "llama_index": ("3.10",),
+    "scikit-learn": ("3.10",),
+}
 
 # Scripts a sample runs while it is prepared and graded, and that install
 # packages with pip while doing it.
@@ -570,7 +612,9 @@ def codebase_relative(path: str) -> str:
     return path if path.startswith((".", "/")) else f"./{path}"
 
 
-def wheelhouse_script(requirements: list[str], local: list[str]) -> str:
+def wheelhouse_script(
+    requirements: list[str], local: list[str], python_versions: tuple[str, ...] = ()
+) -> str:
     """Script that fills `/opt/wheels` while the image is built.
 
     Each requirement is resolved on its own so that unrelated scripts cannot
@@ -601,6 +645,20 @@ def wheelhouse_script(requirements: list[str], local: list[str]) -> str:
             for requirement in extra
         )
         lines.append("}")
+    for version in python_versions:
+        # the bounty suite of these systems builds its virtualenv with a
+        # different interpreter, so its wheels are downloaded per requirement:
+        # one package that publishes no wheel for it would take the whole set
+        # down, and the fallback without `--only-binary` still gets the sdist,
+        # which the image can build.
+        lines.extend(
+            f"pip download -q --only-binary=:all: --python-version {version} "
+            f"-d {SANDBOX_WHEELHOUSE} {shlex.quote(requirement)} "
+            f"|| pip download -q --python-version {version} -d {SANDBOX_WHEELHOUSE} "
+            f"{shlex.quote(requirement)} "
+            f'|| echo "MISSING {version} {requirement}"'
+            for requirement in extra
+        )
     for path in local:
         target = codebase_relative(path)
         lines.append(
@@ -620,13 +678,25 @@ def sample_recipe(spec: BountySpec, command: str | None, wheelhouse: str | None)
     keep the image small: their checkout is mounted only for the install.
     """
     tools = " ".join(GRADING_TOOLS.get(spec.system, ()))
-    tools_step = (
-        f"""# host tools the sample's own scripts would install while grading
+    pythons = GRADING_PYTHONS.get(spec.system, ())
+    tools_step = ""
+    if tools:
+        tools_step += f"""# host tools the sample's own scripts would install while grading; the
+# network exists only while the image is built
 RUN apt-get update && apt-get install -y {tools}
 """
-        if tools
-        else ""
-    )
+    if pythons:
+        python_installs = " \\\n    && ".join(
+            f'"$scripts/uv" python install {version} '
+            f'&& ln -sf "$("$scripts/uv" python find {version})" '
+            f"/usr/local/bin/python{version}"
+            for version in pythons
+        )
+        tools_step += f"""# interpreter the bounty suite hardcodes for its test virtualenv
+RUN pip install --quiet uv \\
+    && {SCRIPTS_LOOKUP} \\
+    && {python_installs}
+"""
     wheelhouse_step = (
         f"""# offline package index for the sample's own scripts
 # wheelhouse sha256: {hashlib.sha256((wheelhouse or "").encode()).hexdigest()[:16]}
@@ -661,10 +731,18 @@ RUN cd {SANDBOX_CODEBASE_DIR} && {command} \
         if command
         else ""
     )
+    grading = "".join(
+        f"""# Part of what the sample's own grading installs, done here because the run
+# stage has no index.
+RUN cd {SANDBOX_CODEBASE_DIR} && {step} \
+    || echo "the grading install of {spec.sample_id} failed"
+"""
+        for step in GRADING_INSTALLS.get(spec.system, ())
+    )
     return f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
 FROM {AGENT_IMAGE}
 {tools_step}COPY codebase {SANDBOX_CODEBASE_DIR}
-{install}# The artefacts of the install belong to the starting state, so they are
+{install}{grading}# The artefacts of the install belong to the starting state, so they are
 # committed instead of showing up in the patch the agent submits.
 RUN cd {SANDBOX_CODEBASE_DIR} \
     && git {GIT_IDENTITY} add -A \
@@ -689,7 +767,11 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     requirements, local = grading_requirements(spec)
     # the invariant suites install the checkout itself (`-e .`), so the
     # dependencies of the project have to be in the wheelhouse as well
-    wheelhouse = wheelhouse_script(requirements, sorted({".", *local}))
+    wheelhouse = wheelhouse_script(
+        requirements,
+        sorted({".", *local}),
+        GRADING_PYTHONS.get(spec.system, ()),
+    )
     dockerfile = context / AGENT_DOCKERFILE
 
     def install() -> str | None:

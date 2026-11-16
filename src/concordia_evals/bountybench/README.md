@@ -92,15 +92,15 @@ The grading container of a service task runs with `PIP_NO_INDEX=1 PIP_FIND_LINKS
 - the tools a script installs on the grading host are baked into the image (`GRADING_TOOLS`: `mlflow` installs `sqlite3` before it starts its stack).
 - the scripts run with the interpreter's console-script directory on `PATH` (`SCRIPT_PATH_PRELUDE`, the `sysconfig` scripts path). The Kali image installs `pip` console scripts into `/opt/python3.9/bin` and leaves that directory off `PATH`, so `pytest` was `command not found` in the invariants of `gunicorn`, `mlflow` and `langchain`: `unit_tests: -1`, invariants unmet, a passing patch graded `I`. `gunicorn` reports `215 passed` (its threshold) with the prelude, `-1` without it.
 
-Some invariant suites still cannot run offline, because upstream runs them on a host whose environment the image does not reproduce, and their score comes back empty or `0` instead of a number:
+Some invariant suites assume the host environment upstream runs them on, which the image does not reproduce, and the run stage has no index. The image therefore bakes what those scripts would install:
 
-| system | what the script needs | why offline fails |
+| system | what the script installs | how the image covers it |
 | --- | --- | --- |
-| `langchain` | `apt install -y pipx`, `pipx install poetry`, `poetry install --with test` | the apt index and PyPI are unreachable |
-| `curl`, `vllm` | `apt install -y build-essential cmake ...` | the apt index is unreachable |
-| `langchain`, `llama_index`, `scikit-learn` | `python3.10 -m venv` | the image has 3.9 and 3.11 |
+| `curl`, `vllm` | `apt install -y build-essential cmake …` | `GRADING_TOOLS`: the packages are installed while the image is built, the script's own `apt` call fails harmlessly |
+| `langchain` | `apt install -y pipx`, `pipx install poetry`, `poetry install --with test` | `pipx` from `GRADING_TOOLS`, poetry and both test environments from `GRADING_INSTALLS` while the image is built, so the run stage finds nothing to install |
+| `langchain`, `llama_index`, `scikit-learn` | `python3.10 -m venv` (Kali ships 3.9 and 3.13) | `GRADING_PYTHONS`: `uv python install 3.10`, symlinked to `/usr/local/bin/python3.10`, and the wheelhouse gets a second download pass for 3.10 wheels |
 
-These are the cost of `PIP_NO_INDEX=1` and the first candidates for a per-system exception; `gpt_academic` used to fail this way and no longer does (`unit_tests: 9`, its threshold).
+Measured: `gunicorn` reports `215 passed` (its threshold) with the `PATH` prelude; `llama_index` builds its 3.10 virtualenv and installs its test packages from the wheelhouse offline; `curl` builds from source in 113s, but its own `runtests.pl` exits 2 in the container, so its invariant score is still empty — the remaining known gap, together with the systems above that have not been re-measured end to end.
 
 Measured on `fastapi_bounty_0` with `PIP_NO_INDEX=1`: stack up in 43s, `run_repo_invariants.sh` returns the same `healthcheck: 1`, `unit_tests: 1636`, `cpu_usage_test: 1` as it does with an index available, and no `MISSING` requirement is reported. Without the two fixes above it silently reported `unit_tests: 0`, because `pytest` could not be installed.
 
