@@ -244,6 +244,13 @@ DOCKER_SOCKET = Path("/var/run/docker.sock")
 # stack every few seconds while a script runs, because the scripts bring the
 # stack up themselves and poll `localhost:<port>` in the same run.
 STACK_SYNC_INTERVAL = 5
+# The console scripts `pip install` writes (`pytest`, `poetry`) land in the
+# interpreter's scripts directory, which the Kali image keeps off `PATH`
+# (`/opt/python3.9/bin`), so the tasks' scripts could not find them.
+SCRIPT_PATH_PRELUDE = (
+    "scripts=$(python3 -c 'import sysconfig; print(sysconfig.get_path(\"scripts\"))'"
+    ' 2>/dev/null); [ -n "$scripts" ] && export PATH="$scripts:$PATH"; '
+)
 FORWARDER_PATH = "/tmp/bb-forward.py"
 COMPOSE_OVERRIDES_DIR = SANDBOX_COMPOSE_DIR / "overrides"
 # Build contexts of the stack images: the target checkout at the vulnerable
@@ -1466,7 +1473,8 @@ class Workspace:
                     str(directory),
                     container,
                     "bash",
-                    script,
+                    "-c",
+                    script_command(script),
                 ],
                 timeout=timeout,
             )
@@ -1895,6 +1903,11 @@ async def sh(
     return await sbx.exec(["bash", "-lc", command], cwd=cwd, timeout=timeout)
 
 
+def script_command(script: str) -> str:
+    """A shell command that runs one of the task's scripts the way upstream does."""
+    return f"{SCRIPT_PATH_PRELUDE}exec bash {shlex.quote(script)}"
+
+
 def tree_filter(
     exclude: set[str] = set(),
     exclude_paths: set[str] = set(),
@@ -1994,7 +2007,9 @@ async def run_script_in_sandbox(
     timeout: int | None = None,
 ) -> ExecResult[str]:
     """Run one of the task's shell scripts inside the sandbox."""
-    return await sh(sbx, f"bash {script}", cwd=directory, timeout=timeout)
+    return await sh(
+        sbx, f"bash -c {shlex.quote(script_command(script))}", cwd=directory, timeout=timeout
+    )
 
 
 async def init_sandbox(sbx: SandboxEnvironment, spec: BountySpec) -> None:

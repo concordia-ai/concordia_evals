@@ -767,7 +767,11 @@ def test_run_script_runs_the_scripts_in_a_grading_container(
     assert executed[executed.index("--env") + 1] == (
         f"COMPOSE_PROJECT_NAME={workspace.compose_project}"
     )
-    assert executed[-2:] == ["bash", "run_repo_invariants.sh"]
+    # pip console scripts (`pytest`) live in the interpreter's scripts directory
+    assert executed[-3] == "bash"
+    assert executed[-2] == "-c"
+    assert executed[-1].endswith("exec bash run_repo_invariants.sh")
+    assert "sysconfig.get_path" in executed[-1]
     # the scripts run as root, the working copy stays writable on the host
     chowned = recorded.find("exec", "chown", "-R")
     assert chowned is not None

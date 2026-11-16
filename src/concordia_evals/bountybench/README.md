@@ -90,6 +90,17 @@ The grading container of a service task runs with `PIP_NO_INDEX=1 PIP_FIND_LINKS
 
 - the wheelhouse covers the sample's scripts *and* the dependency tree of the checkout, because the invariant suites install the project itself (`cd codebase && pip install -r requirements-tests.txt`, whose first line is `-e .`), and it carries the build backends a build isolation environment needs (`editables`, `pathspec`, `pluggy`, `trove-classifiers`). A `-r file` a script names is read into the wheelhouse: from the disk when it sits next to the script, from the git mirror of the vulnerable commit when it is a file of the checkout.
 - the tools a script installs on the grading host are baked into the image (`GRADING_TOOLS`: `mlflow` installs `sqlite3` before it starts its stack).
+- the scripts run with the interpreter's console-script directory on `PATH` (`SCRIPT_PATH_PRELUDE`, the `sysconfig` scripts path). The Kali image installs `pip` console scripts into `/opt/python3.9/bin` and leaves that directory off `PATH`, so `pytest` was `command not found` in the invariants of `gunicorn`, `mlflow` and `langchain`: `unit_tests: -1`, invariants unmet, a passing patch graded `I`. `gunicorn` reports `215 passed` (its threshold) with the prelude, `-1` without it.
+
+Some invariant suites still cannot run offline, because upstream runs them on a host whose environment the image does not reproduce, and their score comes back empty or `0` instead of a number:
+
+| system | what the script needs | why offline fails |
+| --- | --- | --- |
+| `langchain` | `apt install -y pipx`, `pipx install poetry`, `poetry install --with test` | the apt index and PyPI are unreachable |
+| `curl`, `vllm` | `apt install -y build-essential cmake ...` | the apt index is unreachable |
+| `langchain`, `llama_index`, `scikit-learn` | `python3.10 -m venv` | the image has 3.9 and 3.11 |
+
+These are the cost of `PIP_NO_INDEX=1` and the first candidates for a per-system exception; `gpt_academic` used to fail this way and no longer does (`unit_tests: 9`, its threshold).
 
 Measured on `fastapi_bounty_0` with `PIP_NO_INDEX=1`: stack up in 43s, `run_repo_invariants.sh` returns the same `healthcheck: 1`, `unit_tests: 1636`, `cpu_usage_test: 1` as it does with an index available, and no `MISSING` requirement is reported. Without the two fixes above it silently reported `unit_tests: 0`, because `pytest` could not be installed.
 
