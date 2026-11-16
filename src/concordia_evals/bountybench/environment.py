@@ -840,8 +840,11 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
             spec.repo_metadata.get("is_python"),
         )
 
-    if image_exists(tag) and codebase.exists() and dockerfile.exists():
-        if dockerfile.read_text() == sample_recipe(spec, install(), wheelhouse):
+    # The stamp is written after a successful build: an interrupted one leaves the
+    # dockerfile of the new recipe next to the image of the old one.
+    stamp = context / "build.stamp"
+    if image_exists(tag) and codebase.exists() and stamp.exists():
+        if stamp.read_text() == sample_recipe(spec, install(), wheelhouse):
             return tag
 
     # The checkout comes from the pruned mirror: for local tasks it becomes the
@@ -869,6 +872,7 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
             f"Unable to build the sandbox image of {spec.sample_id}: "
             f"{built.stderr.strip()[-2_000:]}"
         )
+    stamp.write_text(sample_recipe(spec, install(), wheelhouse))
     return tag
 
 
