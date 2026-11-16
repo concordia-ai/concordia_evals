@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tarfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -693,6 +694,17 @@ def test_sandbox_compose_file_mounts_the_mirror_only_for_service_tasks(
 
     assert "volumes" not in local_compose.read_text()
     assert f"{mirror}:{'/opt/codebase.git'}:ro" in service_compose.read_text()
+
+
+_REAL_ACQUIRE_LOCK = environment.acquire_stack_lock
+_REAL_RELEASE_LOCK = environment.release_stack_lock
+
+
+@pytest.fixture(autouse=True)
+def _no_stack_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lock serializes real runs of a system; the tests do not take it."""
+    monkeypatch.setattr(environment, "acquire_stack_lock", lambda system: None)
+    monkeypatch.setattr(environment, "release_stack_lock", lambda descriptor: None)
 
 
 class _RecordedRun:
@@ -1395,3 +1407,38 @@ def test_sample_recipe_bakes_the_tools_the_scripts_install_while_grading(
     assert "RUN apt-get update && apt-get install -y sqlite3" in recipe
     # a change of the wheelhouse content must rebuild the image
     assert "# wheelhouse sha256: " in recipe
+
+
+def test_verify_script_dir_follows_the_bounty_layout(tmp_path: Path) -> None:
+    """Three bounties keep `verify.sh` at the top of the bounty directory."""
+    nested = tmp_path / "bounty_0"
+    (nested / "verify_files").mkdir(parents=True)
+    (nested / "verify_files" / "verify.sh").write_text("#!/bin/bash\n")
+    assert environment.verify_script_dir(nested) == nested / "verify_files"
+
+    flat = tmp_path / "bounty_1"
+    flat.mkdir()
+    (flat / "verify.sh").write_text("#!/bin/bash\n")
+    assert environment.verify_script_dir(flat) == flat
+
+
+def test_stack_lock_is_exclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two samples of one system must not fight over the fixed container names."""
+    monkeypatch.setattr(environment, "LOCKS_DIR", tmp_path)
+    monkeypatch.setattr(environment, "acquire_stack_lock", _REAL_ACQUIRE_LOCK)
+    monkeypatch.setattr(environment, "release_stack_lock", _REAL_RELEASE_LOCK)
+    held = environment.acquire_stack_lock("demoapp")
+    waited: list[int] = []
+    thread = threading.Thread(
+        target=lambda: waited.append(environment.acquire_stack_lock("demoapp"))
+    )
+    thread.start()
+    thread.join(timeout=0.5)
+
+    # the second caller is still waiting for the first sample
+    assert waited == []
+
+    environment.release_stack_lock(held)
+    thread.join(timeout=5)
+    assert len(waited) == 1
+    environment.release_stack_lock(waited[0])

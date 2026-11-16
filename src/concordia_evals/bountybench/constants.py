@@ -26,6 +26,10 @@ SANDBOX_MIRRORS_DIR = BOUNTYBENCH_CACHE_PATH / "sandbox_mirrors"
 # Build contexts of the per-sample sandbox images (target repository installed).
 SAMPLE_IMAGES_DIR = BOUNTYBENCH_CACHE_PATH / "images"
 WORKSPACES_DIR = BOUNTYBENCH_CACHE_PATH / "workspaces"
+# One lock per system: the compose files of the bounties name their containers
+# (`container_name: mlflow`) and their scripts `docker exec` those names, so two
+# samples of the same system cannot run at the same time.
+LOCKS_DIR = BOUNTYBENCH_CACHE_PATH / "locks"
 SANDBOX_COMPOSE_DIR = BOUNTYBENCH_CACHE_PATH / "compose"
 
 # Shared docker network: every upstream task compose file declares it as an
@@ -58,7 +62,14 @@ SANDBOX_WHEELHOUSE = "/opt/wheels"
 # submitted work (`ExploitAgent`/`PatchAgent`/`DetectAgent` fail on "no_submission").
 SUBMITTED_STORE_KEY = "bountybench_submitted"
 
-DEFAULT_MAX_MESSAGES = 30
+# Upstream's `run_workflow.sh` passes `--phase_iterations 100` and the detect,
+# exploit and patch workflows each have a single root phase, so an agent gets 100
+# iterations of one command each. Here one react turn is an assistant message
+# plus one tool result per command (about two commands per turn in practice), so
+# 150 messages is the same 100 commands. An earlier default of 30 -- about ten
+# turns, twenty commands -- ended every sample while it was still reading the
+# codebase.
+DEFAULT_MAX_MESSAGES = 150
 DEFAULT_RANDOM_SEED = 0
 DEFAULT_SAMPLE_NUM: int | None = None
 

@@ -60,6 +60,7 @@ from concordia_evals.bountybench.environment import (
     sh,
     snapshot_workspace,
     upload_tree,
+    verify_script_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,13 +241,13 @@ async def _run_verify(
     bounty_verify_dir = f"{SANDBOX_GRADING_TREE}/bounties/bounty_{spec.bounty_number}/verify_files"
     if spec.is_service_task:
         if reference:
-            return workspace.run_script(workspace.verify_files_dir, "verify.sh", VERIFY_TIMEOUT)
+            return workspace.run_script(workspace.verify_script_dir, "verify.sh", VERIFY_TIMEOUT)
         # The agent workspace lives inside the sandbox; verify scripts of service
         # tasks also read the files the exploit produced, so mirror the workspace
         # onto the host and reset the verify scripts first (upstream
         # `reset_verify_files`).
         agent_root = await _sync_agent_workspace(sbx, workspace)
-        return workspace.run_script(agent_root / "verify_files", "verify.sh", VERIFY_TIMEOUT)
+        return workspace.run_script(verify_script_dir(agent_root), "verify.sh", VERIFY_TIMEOUT)
     if reference:
         # The caller uploaded the tree and the reference exploit wrote its
         # artefacts into it; re-uploading would discard them.
@@ -265,11 +266,18 @@ async def _sync_agent_workspace(sbx: SandboxEnvironment, workspace: Workspace) -
     """Mirror the agent workspace onto the host for host side grading."""
     agent_root = workspace.root / "agent_workspace"
     await download_tree(sbx, SANDBOX_APP_DIR, agent_root, exclude={"codebase", "verify_files"})
-    verify_dir = agent_root / "verify_files"
-    if verify_dir.exists():
-        shutil.rmtree(verify_dir)
-    shutil.copytree(workspace.verify_files_dir, verify_dir)
-    (verify_dir / "verify.sh").chmod(0o755)
+    source = workspace.verify_script_dir
+    if source == workspace.verify_files_dir:
+        verify_dir = agent_root / "verify_files"
+        if verify_dir.exists():
+            shutil.rmtree(verify_dir)
+        shutil.copytree(source, verify_dir)
+        (verify_dir / "verify.sh").chmod(0o755)
+    else:
+        # the script runs from the top of the mirrored workspace, next to the
+        # `setup_files` tree it reads
+        shutil.copy2(source / "verify.sh", agent_root / "verify.sh")
+        (agent_root / "verify.sh").chmod(0o755)
     return agent_root
 
 

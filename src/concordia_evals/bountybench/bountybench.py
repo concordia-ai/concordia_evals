@@ -11,6 +11,7 @@ Paper: https://arxiv.org/abs/2505.15216
 Task data: https://github.com/bountybench/bountytasks
 """
 
+import asyncio
 from typing import cast
 
 from inspect_ai import Task, task
@@ -33,10 +34,12 @@ from concordia_evals.bountybench.constants import (
 from concordia_evals.bountybench.data import get_dataset, load_bounty_spec
 from concordia_evals.bountybench.environment import (
     Workspace,
+    acquire_stack_lock,
     codebase_listing,
     ensure_sample_image,
     ensure_shared_network,
     init_sandbox,
+    release_stack_lock,
 )
 from concordia_evals.bountybench.prompts import render_prompt
 from concordia_evals.bountybench.scorer import bountybench_scorer
@@ -64,20 +67,36 @@ def setup_bountybench() -> Solver:
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         spec = load_bounty_spec(state.metadata)
-        workspace = Workspace.create(spec)
+        # The compose files of a system name their containers and their scripts
+        # `docker exec` those names, so samples of one system take turns. Waiting
+        # in a thread keeps the event loop (and the sample that holds the stack)
+        # running.
+        lock = await asyncio.to_thread(acquire_stack_lock, spec.system)
+        try:
+            workspace = Workspace.create(spec, lock=lock)
+        except Exception:
+            release_stack_lock(lock)
+            raise
         state.metadata["workspace"] = str(workspace.root)
 
-        # The repository is already installed in the sample image (built from
-        # `ensure_sample_image`), so the sandbox needs no setup commands.
-        sbx = sandbox()
-        await init_sandbox(sbx, spec)
-        # Upstream always runs the setup scripts (no-ops for systems that are not
-        # docker compose services); `detect` binds no bounty setup resource.
-        workspace.start(bounty_setup=state.metadata["task_type"] != "detect")
+        try:
+            # The repository is already installed in the sample image (built from
+            # `ensure_sample_image`), so the sandbox needs no setup commands.
+            sbx = sandbox()
+            await init_sandbox(sbx, spec)
+            # Upstream always runs the setup scripts (no-ops for systems that are
+            # not docker compose services); `detect` binds no bounty setup
+            # resource.
+            workspace.start(bounty_setup=state.metadata["task_type"] != "detect")
 
-        # The task prompt embeds a listing of the agent workspace, which only
-        # exists once the sandbox is up (upstream builds it per phase too).
-        listing = await codebase_listing(sbx)
+            # The task prompt embeds a listing of the agent workspace, which only
+            # exists once the sandbox is up (upstream builds it per phase too).
+            listing = await codebase_listing(sbx)
+        except Exception:
+            # A stack that failed to come up would keep the fixed container names
+            # of the system busy for every later sample.
+            workspace.stop()
+            raise
         state.messages[0] = ChatMessageUser(
             content=render_prompt(state.input_text, codebase=listing)
         )

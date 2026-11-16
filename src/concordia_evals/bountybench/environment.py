@@ -18,6 +18,7 @@ This module keeps that layout:
 
 import atexit
 import base64
+import fcntl
 import hashlib
 import io
 import json
@@ -47,6 +48,7 @@ from concordia_evals.bountybench.constants import (
     CODEBASE_TREE_MAX_TOKENS,
     HEALTHCHECK_TIMEOUT,
     INSTALL_TIMEOUT,
+    LOCKS_DIR,
     SAMPLE_IMAGES_DIR,
     SANDBOX_APP_DIR,
     SANDBOX_CODEBASE_DIR,
@@ -100,6 +102,43 @@ def run_host(
         check=False,
         env={**os.environ, **env} if env else None,
     )
+
+
+def acquire_stack_lock(system: str) -> int:
+    """Hold the target stack of one system for the caller.
+
+    The compose files of the bounties name their containers (`container_name:
+    mlflow`, `lunary-postgres`) and their scripts `docker exec` those names, so
+    two samples of the same system would fight over one container. The lock is a
+    file, released by the kernel if the process dies.
+    """
+    LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(LOCKS_DIR / f"{system}.lock", os.O_CREAT | os.O_RDWR, 0o664)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.info(f"Another sample of {system} is running: waiting for it to finish")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def release_stack_lock(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    os.close(descriptor)
+
+
+def verify_script_dir(bounty_dir: Path) -> Path:
+    """Directory holding the bounty's `verify.sh`.
+
+    Most bounties keep it in `verify_files/`; `neural-compressor`, `imaginairy`
+    and `open-webui` keep it at the top of the bounty directory and resolve the
+    files they read (`setup_files/...`) relative to it, so the directory it runs
+    from is the bounty directory rather than `verify_files/`.
+    """
+    nested = bounty_dir / "verify_files"
+    return nested if (nested / "verify.sh").is_file() else bounty_dir
 
 
 def ensure_shared_network(name: str = SHARED_NETWORK) -> None:
@@ -534,13 +573,27 @@ def wheelhouse_script(requirements: list[str], local: list[str]) -> str:
     lines = ["#!/bin/bash", "set -o pipefail", f"mkdir -p {SANDBOX_WHEELHOUSE}"]
     baseline = " ".join(WHEELHOUSE_BASELINE)
     lines.append(f"pip download -q -d {SANDBOX_WHEELHOUSE} {baseline} || true")
-    for requirement in requirements:
-        if requirement.lower() in {name.lower() for name in WHEELHOUSE_BASELINE}:
-            continue
+    extra = [
+        requirement
+        for requirement in requirements
+        if requirement.lower() not in {name.lower() for name in WHEELHOUSE_BASELINE}
+    ]
+    if extra:
+        quoted = " ".join(shlex.quote(requirement) for requirement in extra)
+        # One resolution for all of them: a set of versions that satisfies every
+        # requirement at once. Downloading them one by one cannot, because the
+        # wheelhouse then holds two versions of a package they disagree on.
+        # Wheels only first: the image has no toolchain to build an sdist.
         lines.append(
-            f"pip download -q -d {SANDBOX_WHEELHOUSE} {shlex.quote(requirement)} "
-            f'|| echo "MISSING {requirement}"'
+            f"pip download -q --only-binary=:all: -d {SANDBOX_WHEELHOUSE} {quoted} "
+            f"|| pip download -q -d {SANDBOX_WHEELHOUSE} {quoted} || {{"
         )
+        lines.extend(
+            f"  pip download -q -d {SANDBOX_WHEELHOUSE} {shlex.quote(requirement)} "
+            f'|| echo "MISSING {requirement}"'
+            for requirement in extra
+        )
+        lines.append("}")
     for path in local:
         target = codebase_relative(path)
         lines.append(
@@ -826,7 +879,7 @@ class Workspace:
     `bounties/bounty_N/`.
     """
 
-    def __init__(self, spec: BountySpec, root: Path) -> None:
+    def __init__(self, spec: BountySpec, root: Path, lock: int | None = None) -> None:
         self.spec = spec
         self.root = root
         self.containers: list[str] = []
@@ -838,13 +891,19 @@ class Workspace:
         self._ports: dict[str, list[tuple[str, int, int, str]]] = {}
         self._build_services: dict[str, dict[str, StackBuild]] = {}
         self._stack_lock = threading.Lock()
+        # `create` takes the stack of the system (and hands it in), so that the
+        # wait for another sample happens off the event loop
+        self._lock: int | None = lock
 
     @classmethod
-    def create(cls, spec: BountySpec, cache_dir: Path = WORKSPACES_DIR) -> "Workspace":
+    def create(
+        cls, spec: BountySpec, cache_dir: Path = WORKSPACES_DIR, lock: int | None = None
+    ) -> "Workspace":
         cache_dir.mkdir(parents=True, exist_ok=True)
         root = Path(tempfile.mkdtemp(prefix=f"{spec.sample_id}-", dir=cache_dir))
-        workspace = cls(spec=spec, root=root)
+        workspace = cls(spec=spec, root=root, lock=lock if lock is not None else None)
         workspace.prepare()
+        workspace.clear_stale_stack()
         _LIVE_WORKSPACES[str(root)] = workspace
         return workspace
 
@@ -868,6 +927,10 @@ class Workspace:
     @property
     def verify_files_dir(self) -> Path:
         return self.bounty_dir / "verify_files"
+
+    @property
+    def verify_script_dir(self) -> Path:
+        return verify_script_dir(self.bounty_dir)
 
     @property
     def reference_exploit_dir(self) -> Path:
@@ -1005,6 +1068,19 @@ class Workspace:
         self._build_services[key] = services
         return services
 
+    def all_build_services(self) -> dict[str, StackBuild]:
+        """Images of the workspace by service, over every compose file it holds.
+
+        Most systems compose at the top of the task directory, some only from the
+        bounty setup directory (`gpt_academic`), so both have to be built and
+        both carry the code under test.
+        """
+        services: dict[str, StackBuild] = {}
+        for directory in self.compose_dirs:
+            for service, build in self.build_services(directory).items():
+                services.setdefault(service, build)
+        return services
+
     def build_stack_images(self) -> None:
         """Build the images of the stack from the vulnerable checkout.
 
@@ -1012,7 +1088,7 @@ class Workspace:
         that `docker compose` starts from there fails. The image is built once per
         sample and reused by every stage.
         """
-        for service, build in sorted(self.build_services(self.root).items()):
+        for service, build in sorted(self.all_build_services().items()):
             pristine = self.pristine_context()
             dockerfile = _map_to_pristine(build.dockerfile, self.root, pristine)
             stamp_path = COMPOSE_IMAGE_DIR / f"{self.spec.sample_id}-{service}.dockerfile"
@@ -1079,6 +1155,34 @@ class Workspace:
             self._ports[key] = compose_ports(directory, self.compose_project)
         return self._ports[key]
 
+    def clear_stale_stack(self) -> None:
+        """Remove the containers a killed run of this system left behind.
+
+        The lock makes the stack of a system exclusive, so a container of this
+        system that is not ours belongs to a process that died without tearing
+        its stack down, and it blocks the fixed names of the compose files.
+        """
+        for directory in self.compose_dirs:
+            for definition in compose_definition(directory, self.compose_project).values():
+                name = definition.get("container_name")
+                if not name:
+                    continue
+                removed = run_host(["docker", "rm", "--force", name], timeout=300)
+                if removed.returncode == 0:
+                    logger.warning(f"Removed the leftover container {name}")
+        listed = run_host(
+            ["docker", "ps", "--all", "--quiet", "--filter", f"name={GRADER_CONTAINER_PREFIX}"]
+        )
+        for container in listed.stdout.split():
+            inspected = run_host(
+                ["docker", "inspect", "--format", "{{.Name}}", container], timeout=120
+            )
+            name = inspected.stdout.strip()
+            if not name.startswith(f"/{GRADER_CONTAINER_PREFIX}{self.spec.system}_bounty_"):
+                continue
+            run_host(["docker", "rm", "--force", name.lstrip("/")], timeout=300)
+            logger.warning(f"Removed the leftover grading container {name.lstrip('/')}")
+
     def prepare(self) -> None:
         """Copy system files and check out the codebase at the vulnerable commit."""
         shutil.copytree(
@@ -1132,7 +1236,7 @@ class Workspace:
         rebuild, which would reinstall the dependencies, i.e. download packages
         while the evaluation runs.
         """
-        services = self.build_services(self.root)
+        services = self.all_build_services()
         if not services:
             return
         stamp = self.code_stamp()
@@ -1259,6 +1363,8 @@ class Workspace:
         building (and therefore without downloading) anything.
         """
         _LIVE_WORKSPACES.pop(str(self.root), None)
+        if not self.root.exists() and self._lock is None:
+            return
         self._stop_grader_container()
         if self.root.exists():
             for directory in self.compose_dirs:
@@ -1269,6 +1375,8 @@ class Workspace:
                     env=self.compose_env(directory),
                 )
         shutil.rmtree(self.root, ignore_errors=True)
+        release_stack_lock(self._lock)
+        self._lock = None
 
     def restart(self, bounty_setup: bool = True) -> None:
         """Restart the target system after the codebase changed."""
@@ -1609,6 +1717,9 @@ SECURITY_ARCHIVE = "http://snapshot.debian.org/archive/debian-security/20260201T
 BUILD_FIXES: dict[str, BuildFix] = {
     "gradio": BuildFix(constraints=("huggingface_hub<0.30",)),
     "pytorch-lightning": BuildFix(constraints=("setuptools<81",)),
+    # `requirements.txt` pins `protobuf==3.20` and leaves `pyautogen` unpinned,
+    # while the current release of it needs protobuf 5
+    "gpt_academic": BuildFix(constraints=("pyautogen<0.3",)),
     # `lunary` builds its database image from `postgres:15-bullseye`: that image
     # bakes package lists naming `bullseye-security` versions Debian has since
     # removed from its pool, and `bullseye-pgdg` moved to the archive (the
@@ -1917,8 +2028,12 @@ async def init_sandbox(sbx: SandboxEnvironment, spec: BountySpec) -> None:
     clone = await sh(sbx, " && ".join(commands), timeout=1_800)
     if not clone.success:
         raise RuntimeError(f"Failed to prepare the agent workspace: {clone.stderr}")
-    await upload_tree(sbx, spec.bounty_dir / "verify_files", SANDBOX_VERIFY_DIR, skip_hidden=True)
-    await sh(sbx, f"chmod -R a+x {SANDBOX_VERIFY_DIR} || true")
+    # a few tasks (`neural-compressor`, `imaginairy`, `open-webui`) ship no
+    # `verify_files`, their `verify.sh` needs nothing next to it
+    verify_files = spec.bounty_dir / "verify_files"
+    if verify_files.is_dir():
+        await upload_tree(sbx, verify_files, SANDBOX_VERIFY_DIR, skip_hidden=True)
+        await sh(sbx, f"chmod -R a+x {SANDBOX_VERIFY_DIR} || true")
     # Upstream tracks the workspace with a git repository (ignoring the codebase)
     # and uses it to drop the side effects of each exploit run.
     await sh(
