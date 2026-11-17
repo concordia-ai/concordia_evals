@@ -210,3 +210,12 @@
   (model, harness) 分组，各模式取 success accuracy（多次运行取平均），
   输出每组的 e2e / patch-only / composite 表。
   `uv run python -m concordia_evals.cybergym_e2e.report <.eval文件或目录>`
+- [x] **综合分改为原生指标（jinge 反馈：后处理脚本进不了平台 pipeline）**：
+  新增 `mode="both"`——每个任务生成 e2e + patch-only 配对样本（样本 id
+  `<task>#<mode>`，metadata.mode 逐样本携带），一次 eval 跑两种模式；
+  scorer 的 "success" 指标下原生注册 `composite_weighted` 自定义 metric
+  （按 sample_metadata.mode 分组取 success 均值后加权），综合分直接出现在
+  eval 日志 results 里，pipeline 原生可读。单模式运行的行为不变
+  （composite_weighted 只在 mode="both" 时注册）。report.py 仍保留作
+  历史两趟日志的离线合成工具。注意：both 模式每任务跑两遍，成本≈e2e +
+  patch-only（后者有 crash.log 喂线索，token 远少于 e2e 发现阶段）。

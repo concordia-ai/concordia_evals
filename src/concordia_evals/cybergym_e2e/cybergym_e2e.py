@@ -128,6 +128,13 @@ def ground_truth_solver() -> Solver:
     return solve
 
 
+def sample_modes(mode: str) -> list[str]:
+    """Per-task modes to instantiate: "both" runs each task in both modes."""
+    if mode == "both":
+        return ["e2e", "patch-only"]
+    return [mode]
+
+
 def build_samples(
     *,
     mode: str,
@@ -186,29 +193,30 @@ def build_samples(
             slug, build_image, task_data_dir, script_dir, compose_dir, setup_proxy
         )
 
-        samples.append(
-            Sample(
-                input=get_prompt(mode, repo_to_patch, prompt_style),  # type: ignore[arg-type]
-                id=task_path,
-                sandbox=SandboxEnvironmentSpec(type="docker", config=compose_file),
-                metadata={
-                    "task_path": task_path,
-                    "task_id": config.get("task_id", ""),
-                    "target_prog": config.get("target_prog", ""),
-                    "mode": mode,
-                    "prompt_style": prompt_style,
-                    "build_image": build_image,
-                    "repo_to_patch": repo_to_patch,
-                    "immutable_files": config.get("immutable_files", []),
-                    "pre_patches": pre_patches,
-                    "task_data_dir": str(task_data_dir),
-                    "script_dir": str(script_dir),
-                    "compose_file": compose_file,
-                    "validation_compile_timeout": validation_compile_timeout,
-                    "setup_proxy": setup_proxy,
-                },
+        for sample_mode in sample_modes(mode):
+            samples.append(
+                Sample(
+                    input=get_prompt(sample_mode, repo_to_patch, prompt_style),  # type: ignore[arg-type]
+                    id=f"{task_path}#{sample_mode}" if mode == "both" else task_path,
+                    sandbox=SandboxEnvironmentSpec(type="docker", config=compose_file),
+                    metadata={
+                        "task_path": task_path,
+                        "task_id": config.get("task_id", ""),
+                        "target_prog": config.get("target_prog", ""),
+                        "mode": sample_mode,
+                        "prompt_style": prompt_style,
+                        "build_image": build_image,
+                        "repo_to_patch": repo_to_patch,
+                        "immutable_files": config.get("immutable_files", []),
+                        "pre_patches": pre_patches,
+                        "task_data_dir": str(task_data_dir),
+                        "script_dir": str(script_dir),
+                        "compose_file": compose_file,
+                        "validation_compile_timeout": validation_compile_timeout,
+                        "setup_proxy": setup_proxy,
+                    },
+                )
             )
-        )
     logger.info("Built %d samples for cybergym_e2e (%s)", len(samples), mode)
     return samples
 
@@ -233,8 +241,11 @@ def cybergym_e2e(
     """CyberGym-E2E evaluation task.
 
     Args:
-        mode: "e2e" (discover + PoC + patch) or "patch-only" (patch given
-            crash log and ground-truth PoC).
+        mode: "e2e" (discover + PoC + patch), "patch-only" (patch given
+            crash log and ground-truth PoC), or "both" (each task runs in
+            both modes as paired samples; the "success" metrics additionally
+            report composite_weighted, the native 0.6*e2e + 0.4*patch-only
+            score, so the pipeline reads it from the log directly).
         harness: Agent harness name ("react", "claude_code", "codex_cli",
             "kimi_code", "gemini_cli", "opencode"). The model is chosen with
             inspect's --model and proxied into the sandbox via the agent
@@ -269,8 +280,8 @@ def cybergym_e2e(
     Returns:
         An Inspect Task for CyberGym-E2E.
     """
-    if mode not in ("e2e", "patch-only"):
-        raise ValueError(f"mode must be 'e2e' or 'patch-only', got {mode!r}")
+    if mode not in ("e2e", "patch-only", "both"):
+        raise ValueError(f"mode must be 'e2e', 'patch-only' or 'both', got {mode!r}")
     if prompt_style not in ("iterative", "no-test"):
         raise ValueError(f"prompt_style must be 'iterative' or 'no-test', got {prompt_style!r}")
 
@@ -309,5 +320,5 @@ def cybergym_e2e(
             )
         ),
         solver=solver,
-        scorer=cybergym_e2e_scorer(),
+        scorer=cybergym_e2e_scorer(include_composite=(mode == "both")),
     )

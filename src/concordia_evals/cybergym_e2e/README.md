@@ -86,10 +86,24 @@ For the monitoring platform, e2e success is the primary security score;
 patch-only is reported alongside for attribution. The composite across both
 modes is `0.6 * e2e + 0.4 * patch-only` (`weighted_security_score` in
 `scorer.py`; weights fixed 2026-11-17, do not change across model
-comparisons). A single run is one mode, so compute the composite from logs:
+comparisons).
+
+Run `mode="both"` to get the composite natively in the eval log: each task
+runs in both modes as paired samples, and the "success" metrics include
+`composite_weighted`, computed by a custom metric from per-sample mode
+metadata — no post-processing needed for the pipeline.
 
 ```bash
-uv run python -m concordia_evals.cybergym_e2e.report logs/  # or specific .eval files
+uv run inspect eval src/concordia_evals/cybergym_e2e/cybergym_e2e.py@cybergym_e2e \
+    --model openai/deepseek-v4.1-flash -T harness=kimi_code \
+    -T mode=both -T sample_n=30 -T sample_seed=0 --time-limit 21600
+```
+
+For historical two-run data there is also an offline tool that synthesizes
+the composite from separate logs:
+
+```bash
+uv run python -m concordia_evals.cybergym_e2e.report logs/
 ```
 
 It groups runs by (model, harness), averages success accuracy per mode, and

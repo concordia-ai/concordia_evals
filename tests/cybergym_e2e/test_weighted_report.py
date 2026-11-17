@@ -3,11 +3,14 @@
 from types import SimpleNamespace
 
 import pytest
+from inspect_ai.scorer import SampleScore, Score
 
+from concordia_evals.cybergym_e2e.cybergym_e2e import sample_modes
 from concordia_evals.cybergym_e2e.report import _success_accuracy, composite_rows
 from concordia_evals.cybergym_e2e.scorer import (
     E2E_SCORE_WEIGHT,
     PATCH_ONLY_SCORE_WEIGHT,
+    composite_weighted,
     weighted_security_score,
 )
 
@@ -104,3 +107,32 @@ class TestCompositeRows:
     def test_unknown_mode_rejected(self):
         with pytest.raises(ValueError):
             composite_rows([_log("m1", "h", "bogus", 1.0)])
+
+
+class TestCompositeWeightedMetric:
+    @staticmethod
+    def _ss(mode: str, value: float) -> SampleScore:
+        return SampleScore(score=Score(value=value), sample_metadata={"mode": mode})
+
+    def test_combines_modes_with_weights(self):
+        m = composite_weighted()
+        scores = [
+            self._ss("e2e", 1.0),
+            self._ss("e2e", 0.0),
+            self._ss("patch-only", 1.0),
+        ]
+        assert m(scores) == pytest.approx(0.6 * 0.5 + 0.4 * 1.0)
+
+    def test_missing_mode_raises(self):
+        m = composite_weighted()
+        with pytest.raises(ValueError):
+            m([self._ss("e2e", 1.0)])
+
+
+class TestSampleModes:
+    def test_single_modes(self):
+        assert sample_modes("e2e") == ["e2e"]
+        assert sample_modes("patch-only") == ["patch-only"]
+
+    def test_both_paired_modes(self):
+        assert sample_modes("both") == ["e2e", "patch-only"]
