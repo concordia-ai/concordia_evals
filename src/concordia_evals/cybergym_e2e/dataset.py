@@ -234,7 +234,7 @@ def download_task_data(
         Path to the task's local data directory.
     """
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub.utils import EntryNotFoundError, GatedRepoError
 
     task_data_dir = data_dir / "projects" / task_path
     for filename in TASK_DATA_FILES:
@@ -253,6 +253,15 @@ def download_task_data(
             if required and filename != "crash.log":
                 raise
             logger.debug("Optional file %s missing for %s", filename, task_path)
+        except GatedRepoError:
+            # Without HF_TOKEN the Hub 403s on the whole repo before it can
+            # tell us a file is absent. crash.log is optional (some tasks
+            # genuinely lack it), so treat a gated 403 like "not found" for
+            # that file only; anything else really needs the token.
+            if filename == "crash.log":
+                logger.debug("crash.log gated/missing (no HF_TOKEN?) for %s", task_path)
+            else:
+                raise
     return task_data_dir
 
 

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from concordia_evals.cybergym_e2e import dataset
 from concordia_evals.cybergym_e2e.dataset import (
     DEFAULT_BUILD_IMAGE,
     list_tasks,
@@ -131,3 +132,39 @@ def test_diverse_sample(tmp_path):
     assert {t.split("/")[0] for t in a} == {"pa", "pb", "pc"}  # 每项目一题
     # 项目数 > n 时也只取 n 题
     assert len(diverse_sample(tasks, 2, seed=5, repo_dir=repo)) == 2
+
+
+class TestDownloadTaskDataGated:
+    """Gated-repo 403 (missing HF_TOKEN) must not crash optional crash.log."""
+
+    @staticmethod
+    def _cached(data_dir: Path, task_path: str, files: tuple[str, ...]) -> Path:
+        task_dir = data_dir / "projects" / task_path
+        task_dir.mkdir(parents=True)
+        for name in files:
+            (task_dir / name).write_bytes(b"x")
+        return task_dir
+
+    @staticmethod
+    def _raise_gated(**kwargs):
+        import httpx
+        from huggingface_hub.utils import GatedRepoError
+
+        request = httpx.Request("HEAD", "https://hf-mirror.com/x")
+        response = httpx.Response(403, request=request)
+        raise GatedRepoError("403 gated", response=response)
+
+    def test_gated_crash_log_skipped(self, tmp_path, monkeypatch):
+
+        task_dir = self._cached(tmp_path, "gdbm/arvo_38943", ("src.tgz", "poc.bin"))
+        monkeypatch.setattr("huggingface_hub.hf_hub_download", self._raise_gated)
+        out = dataset.download_task_data("gdbm/arvo_38943", data_dir=tmp_path)
+        assert out == task_dir
+
+    def test_gated_required_file_raises(self, tmp_path, monkeypatch):
+        from huggingface_hub.utils import GatedRepoError
+
+        self._cached(tmp_path, "gdbm/arvo_38943", ("poc.bin",))
+        monkeypatch.setattr("huggingface_hub.hf_hub_download", self._raise_gated)
+        with pytest.raises(GatedRepoError):
+            dataset.download_task_data("gdbm/arvo_38943", data_dir=tmp_path)
