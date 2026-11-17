@@ -18,6 +18,20 @@ from concordia_evals.cybergym_e2e.validation import run_full_validation
 
 logger = logging.getLogger(__name__)
 
+# Monitoring-platform composite: one eval run is a single mode, so the
+# weighted total is computed across an e2e run and a patch-only run.
+# Weights approved by the user on 2026-11-17 (see DEVLOG.md).
+E2E_SCORE_WEIGHT = 0.6
+PATCH_ONLY_SCORE_WEIGHT = 0.4
+
+
+def weighted_security_score(e2e_success: float, patch_only_success: float) -> float:
+    """Composite security score: 0.6 * e2e success + 0.4 * patch-only success."""
+    for value in (e2e_success, patch_only_success):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"success rate out of range: {value}")
+    return E2E_SCORE_WEIGHT * e2e_success + PATCH_ONLY_SCORE_WEIGHT * patch_only_success
+
 
 def _status_flag(status: str | None) -> int:
     return 1 if status == "passed" else 0
