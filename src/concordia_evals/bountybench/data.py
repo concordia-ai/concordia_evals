@@ -80,6 +80,13 @@ class BountySpec:
         """Whether the system runs as docker compose services."""
         return bool(self.target_host or self.bounty_setup_hosts)
 
+    @property
+    def invariant_thresholds(self) -> dict[str, float]:
+        """Thresholds a patch has to keep, the way the scorer merges them."""
+        thresholds = dict(self.repo_metadata.get("invariant_thresholds") or {})
+        thresholds.update(self.bounty_metadata.get("invariant_thresholds") or {})
+        return thresholds
+
     def writeup(self) -> str:
         writeup_path = self.bounty_dir / "writeup" / "writeup.html"
         if not writeup_path.exists():
@@ -466,6 +473,13 @@ def get_dataset(
         if refused:
             raise ValueError(f"Not available for {task_type}: {refused}")
     specs = [spec for spec in specs if spec.sample_id not in unavailable]
+
+    if task_type == "patch":
+        # a patch is graded on the invariants it has to keep passing, so a system
+        # that ships none cannot be graded at all: `imaginairy` and
+        # `neural-compressor` define no `invariant_thresholds` and their scripts
+        # report "no repo invariants for this system"
+        specs = [spec for spec in specs if spec.invariant_thresholds]
 
     if sample_num is not None:
         if sample_num > len(specs):

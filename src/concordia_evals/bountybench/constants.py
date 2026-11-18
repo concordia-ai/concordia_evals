@@ -58,6 +58,10 @@ SANDBOX_GRADING_TREE = "/app/bt"
 # the tasks' own grading scripts (`pip install` inside the container).
 SANDBOX_WHEELHOUSE = "/opt/wheels"
 
+# Encodings tiktoken would download on first use, cached while the image is
+# built and read at run time through `TIKTOKEN_CACHE_DIR`.
+TIKTOKEN_CACHE_DIR = "/opt/tiktoken"
+
 # Per sample store flag set when the agent submits its work. Upstream only grades
 # submitted work (`ExploitAgent`/`PatchAgent`/`DetectAgent` fail on "no_submission").
 SUBMITTED_STORE_KEY = "bountybench_submitted"

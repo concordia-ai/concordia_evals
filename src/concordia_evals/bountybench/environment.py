@@ -59,6 +59,7 @@ from concordia_evals.bountybench.constants import (
     SANDBOX_WHEELHOUSE,
     SHARED_NETWORK,
     STACK_BUILD_TIMEOUT,
+    TIKTOKEN_CACHE_DIR,
     WORKSPACES_DIR,
 )
 from concordia_evals.bountybench.data import (
@@ -314,6 +315,9 @@ PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 # reachable at all; the official images keep their headers in /usr/local.
 NPM_REGISTRY_URL = "https://registry.npmmirror.com"
 NODE_HEADERS_DIR = "/usr/local"
+# Where the image's npm cache is primed for service tasks, whose task directory
+# is a bind mount at run time and so cannot carry `node_modules`.
+NPM_WARM_DIR = "/opt/npm-warm"
 # Plain HTTP over a mirror that does not redirect to HTTPS: the images of some
 # bounties have no CA certificates installed, so a redirect to HTTPS fails to
 # verify ("No system certificates available").
@@ -430,6 +434,16 @@ GRADING_TOOLS: dict[str, tuple[str, ...]] = {
     "langchain": ("pipx",),
 }
 
+# Packages the sample's own grading installs from a script that lives *inside*
+# the checkout, which `grading_requirements` cannot see: it only reads the task's
+# own scripts.
+GRADING_PIP: dict[str, tuple[str, ...]] = {
+    # `scripts/create_test_requirements.sh` pins the suite's requirements with
+    # pip-tools, so without it the suite has no requirements file to install
+    # from and reports no invariant score at all.
+    "gradio": ("pip-tools",),
+}
+
 # Interpreters the bounties create their test virtualenvs with. Kali ships 3.9
 # and 3.13 only, while these tasks hardcode `python3.10 -m venv`, so the image
 # carries one from `uv`.
@@ -459,6 +473,9 @@ GRADING_ENV: dict[str, tuple[tuple[str, str], ...]] = {
         ("POETRY_VIRTUALENVS_PATH", "/root/.cache/pypoetry/virtualenvs"),
         ("POETRY_VIRTUALENVS_IN_PROJECT", "false"),
     ),
+    # tiktoken downloads the `cl100k_base` table on first use; the run stage is
+    # offline, so it reads it from the copy the image caches instead.
+    "llama_index": (("TIKTOKEN_CACHE_DIR", TIKTOKEN_CACHE_DIR),),
 }
 
 GRADING_SETUP: dict[str, tuple[str, ...]] = {
@@ -483,6 +500,15 @@ GRADING_SETUP: dict[str, tuple[str, ...]] = {
     # the IDN tests of the suite run under the locale they name, which the image
     # has to generate or the checks fall back to ASCII
     "curl": ("sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen",),
+    # importing `llama_index.utils` (the tests do it while they are collected)
+    # builds a tokenizer, which makes tiktoken fetch the `cl100k_base` table from
+    # openaipublic: without the download the whole suite fails to collect, so it
+    # is cached here and read from `TIKTOKEN_CACHE_DIR` at run time
+    "llama_index": (
+        "pip install --quiet tiktoken"
+        f" && TIKTOKEN_CACHE_DIR={TIKTOKEN_CACHE_DIR} python3 -c "
+        "\"import tiktoken; tiktoken.get_encoding('cl100k_base')\"",
+    ),
 }
 
 GRADING_PYTHONS: dict[str, tuple[str, ...]] = {
@@ -490,6 +516,20 @@ GRADING_PYTHONS: dict[str, tuple[str, ...]] = {
     "llama_index": ("3.10",),
     "scikit-learn": ("3.10",),
 }
+
+# Suites that install their dependencies with npm. The run stage has no registry,
+# so npm runs while the image is built and `npm_config_offline` makes the suite's
+# own `npm install` resolve the same versions from the cache.
+NPM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "parse-url": (),
+    "yaml": (),
+    # this one's suite also installs a package from the task directory, which is a
+    # bind mount at run time, so it has to be in the cache as well
+    "undici": ("@matteo.collina/tspl",),
+}
+
+for _system in NPM_DEPENDENCIES:
+    GRADING_ENV[_system] = (("npm_config_offline", "true"),)
 
 # Scripts a sample runs while it is prepared and graded, and that install
 # packages with pip while doing it.
@@ -760,6 +800,37 @@ def wheelhouse_script(
     return "\n".join(lines) + "\n"
 
 
+def npm_steps(spec: BountySpec) -> str:
+    """Install the suite's npm dependencies while the image is built.
+
+    The suites run `npm install` at grading time, when the container has no
+    registry, so npm runs here instead. Local tasks keep the tree in the image
+    (`node_modules` is ignored by the checkout's git), service tasks only need
+    the image's npm cache: their task directory is a bind mount at run time.
+    """
+    packages = NPM_DEPENDENCIES.get(spec.system)
+    if packages is None:
+        return ""
+    install = " && ".join(
+        [
+            f"npm config set registry {NPM_REGISTRY_URL}",
+            "npm install --no-audit --no-fund",
+            *(f"npm install --no-audit --no-fund --no-save {package}" for package in packages),
+        ]
+    )
+    failure = f' || echo "the npm setup of {spec.sample_id} failed"'
+    if spec.is_service_task:
+        return f"""# The suite installs with npm, which the run stage has no registry for: the
+# cache this fills is what its own `npm install` resolves from.
+RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},ro \
+    mkdir -p {NPM_WARM_DIR} && cp {SANDBOX_CODEBASE_DIR}/package*.json {NPM_WARM_DIR}/ \
+    && cd {NPM_WARM_DIR} && {SCRIPTS_PATH_STEP} && {install}{failure}
+"""
+    return f"""# The suite installs with npm at grading time, when there is no registry.
+RUN cd {SANDBOX_CODEBASE_DIR} && {SCRIPTS_PATH_STEP} && {install}{failure}
+"""
+
+
 def sample_recipe(spec: BountySpec, command: str | None, wheelhouse: str | None) -> str:
     """Dockerfile of the sandbox image of a sample.
 
@@ -802,6 +873,17 @@ RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
         if wheelhouse is not None
         else ""
     )
+    grading_env = "".join(
+        f"ENV {name}={value}\n" for name, value in GRADING_ENV.get(spec.system, ())
+    )
+    grading = "".join(
+        f"""# Part of what the sample's own grading expects, done here because the run
+# stage is offline.
+RUN cd {SANDBOX_CODEBASE_DIR} && {SCRIPTS_PATH_STEP} && {step} \
+    || echo "the grading setup of {spec.sample_id} failed"
+"""
+        for step in GRADING_SETUP.get(spec.system, ())
+    )
     if spec.is_service_task:
         installs = [command] if command else []
         installs += checkout_install_commands(spec)
@@ -816,7 +898,7 @@ RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
         )
         return f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
 FROM {AGENT_IMAGE}
-{tools_step}{install}{wheelhouse_step}"""
+{tools_step}{install}{grading_env}{grading}{npm_steps(spec)}{wheelhouse_step}"""
     install = (
         f"""# Not fatal, as upstream: a repository that fails to install still gives
 # the agent the code to read.
@@ -847,7 +929,7 @@ RUN cd {SANDBOX_CODEBASE_DIR} && sed -i 's|{old_text}|{new_text}|' {path} \\
     return f"""# Generated by concordia_evals.bountybench: {spec.sample_id}
 FROM {AGENT_IMAGE}
 {tools_step}COPY codebase {SANDBOX_CODEBASE_DIR}
-{harness}{install}{grading_env}{grading}# The artefacts of the install belong to the starting state, so they are
+{harness}{install}{grading_env}{grading}{npm_steps(spec)}# The artefacts of the install belong to the starting state, so they are
 # committed instead of showing up in the patch the agent submits.
 RUN cd {SANDBOX_CODEBASE_DIR} \
     && git {GIT_IDENTITY} add -A \
@@ -884,6 +966,7 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     # and in the container they are run in (service tasks), so every sample gets
     # the offline index of its grading requirements.
     requirements, local = grading_requirements(spec)
+    requirements = [*requirements, *GRADING_PIP.get(spec.system, ())]
     # the invariant suites install the checkout itself (`-e .`), so the
     # dependencies of the project have to be in the wheelhouse as well
     wheelhouse = wheelhouse_script(

@@ -1012,6 +1012,82 @@ def test_patch_task_skips_the_bounty_whose_fix_changes_dependencies(
         data.get_dataset("patch", bounties="fastapi:0")
 
 
+def test_patch_task_skips_a_system_that_defines_no_invariants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skip a system without invariants.
+
+    A patch is graded on the invariants it keeps, so `imaginairy` and
+    `neural-compressor`, which define none, can only ever be graded incorrect.
+    """
+    root = _make_bounty_tasks_tree(tmp_path)
+    system = root / "demoapp"
+    (system / "metadata.json").write_text(json.dumps({"target_host": "demoapp:8080"}))
+    bounty_metadata = json.loads(
+        (system / "bounties" / "bounty_0" / "bounty_metadata.json").read_text()
+    )
+    del bounty_metadata["invariant_thresholds"]
+    (system / "bounties" / "bounty_0" / "bounty_metadata.json").write_text(
+        json.dumps(bounty_metadata)
+    )
+    monkeypatch.setattr(data, "ensure_bountytasks", lambda _dir: root)
+    monkeypatch.setattr(data, "ensure_sandbox_mirror", lambda spec: tmp_path)
+
+    assert data.get_dataset("patch").samples == []
+    assert [sample.id for sample in data.get_dataset("exploit").samples] == ["demoapp_bounty_0"]
+
+
+def test_invariant_thresholds_merge_the_bounty_over_the_repo(tmp_path: Path) -> None:
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    assert spec.invariant_thresholds == {"healthcheck": 1, "unit_tests": 12}
+
+
+def test_node_suites_install_their_dependencies_while_the_image_is_built(
+    tmp_path: Path,
+) -> None:
+    """The run stage has no npm registry, so the tree has to come from the image."""
+    root = _make_bounty_tasks_tree(tmp_path)
+    (root / "demoapp").rename(root / "parse-url")
+    (root / "parse-url" / "metadata.json").write_text(json.dumps({"invariant_thresholds": {}}))
+    recipe = sample_recipe(_spec(root), None, None)
+
+    assert "npm config set registry https://registry.npmmirror.com" in recipe
+    assert "cd /app/codebase && " in recipe
+    assert "ENV npm_config_offline=true" in recipe
+
+
+def test_service_node_suite_primes_the_npm_cache_from_the_mounted_checkout(
+    tmp_path: Path,
+) -> None:
+    """`undici` is a service task: its task directory is a mount at run time."""
+    root = _make_bounty_tasks_tree(tmp_path)
+    (root / "demoapp").rename(root / "undici")
+    recipe = sample_recipe(_spec(root), None, None)
+
+    assert "mkdir -p /opt/npm-warm" in recipe
+    assert "npm install --no-audit --no-fund --no-save @matteo.collina/tspl" in recipe
+
+
+def test_llama_index_caches_the_tiktoken_table_it_would_download(tmp_path: Path) -> None:
+    root = _make_bounty_tasks_tree(tmp_path)
+    (root / "demoapp").rename(root / "llama_index")
+    (root / "llama_index" / "metadata.json").write_text(json.dumps({"invariant_thresholds": {}}))
+    recipe = sample_recipe(_spec(root), None, None)
+
+    assert "tiktoken.get_encoding('cl100k_base')" in recipe
+    assert f"ENV TIKTOKEN_CACHE_DIR={environment.TIKTOKEN_CACHE_DIR}" in recipe
+
+
+def test_gradio_gets_pip_tools_in_its_wheelhouse() -> None:
+    """The tool it needs is installed from a script inside the checkout.
+
+    `grading_requirements` only reads the task's own scripts, so it cannot see
+    `scripts/create_test_requirements.sh` and its pip-tools.
+    """
+    assert environment.GRADING_PIP["gradio"] == ("pip-tools",)
+
+
 def test_build_context_ignores_the_volatile_checkout_files(tmp_path: Path) -> None:
     """Two clones of the same commit must hash the same, or nothing is cached."""
     environment.pin_build_context(tmp_path)
