@@ -212,6 +212,47 @@ def stack_image_tag(spec: BountySpec, service: str) -> str:
     return f"{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}:latest"
 
 
+def _without_cpython_build(command: str) -> str:
+    """Drop a from-source CPython build from an upstream install command.
+
+    Some bounties install CPython themselves (`--enable-optimizations`, an LTO/PGO
+    build that alone takes tens of minutes and downloads the tarball over a slow
+    proxy), which makes the image build of a sample exceed the install timeout.
+    The sandbox image already ships that interpreter, and the only thing the
+    bounties' scripts need from the build is the `python<full version>` symlink
+    the command creates, so the build is replaced by that symlink.
+    """
+    if "www.python.org/ftp/python" not in command:
+        return command
+    steps = [step.strip() for step in command.split(" && ")]
+    download = next(
+        (index for index, step in enumerate(steps) if "www.python.org/ftp/python" in step),
+        None,
+    )
+    if download is None:
+        return command
+    # the build ends with the cleanup of its own working copy
+    cleanup = next(
+        (
+            index
+            for index in range(download, len(steps))
+            if steps[index].startswith("rm -rf Python-")
+        ),
+        len(steps) - 1,
+    )
+    version = re.search(r"Python-([\d.]+)\.tgz", steps[download])
+    if version is None:
+        return command
+    full, minor = version.group(1), ".".join(version.group(1).split(".")[:2])
+    return " && ".join(
+        [
+            *steps[:download],
+            f'ln -sf "$(command -v python{minor})" /usr/local/bin/python{full}',
+            *steps[cleanup + 1 :],
+        ]
+    )
+
+
 def install_script(
     codebase: Path, install_command: str | None, is_python: bool | None
 ) -> str | None:
@@ -224,7 +265,7 @@ def install_script(
     else:
         python_repo = is_python
     if python_repo:
-        return install_command or "pip install -e ."
+        return _without_cpython_build(install_command or "pip install -e .")
     if not (codebase / "CMakeLists.txt").exists():
         return None
     return install_command or "make install"
@@ -423,9 +464,11 @@ GRADING_ENV: dict[str, tuple[tuple[str, str], ...]] = {
 GRADING_SETUP: dict[str, tuple[str, ...]] = {
     # `run_repo_invariants.sh` installs poetry with pipx and then builds both test
     # virtualenvs; the sandbox has no index, so they are built here instead.
-    # Poetry downloads from pypi.org, which is unusably slow from here, so the
-    # locked requirements are exported and fetched by `pip` from the image's
-    # index, which leaves `poetry install` with nothing to download.
+    # Poetry resolves against pypi.org, which is unusably slow from here and whose
+    # requests it never times out, so the locked requirements are exported and
+    # installed by `pip` from the image's index, and the project itself is added
+    # as an editable install without touching the network again: `poetry install`
+    # would repeat the resolution against pypi.org for nothing.
     "langchain": (
         "pip install --quiet poetry poetry-plugin-export",
         *(
@@ -433,7 +476,7 @@ GRADING_SETUP: dict[str, tuple[str, ...]] = {
             " && poetry export --with test --without-hashes -f requirements.txt"
             " -o /tmp/poetry-requirements.txt"
             " && poetry run pip install --quiet -r /tmp/poetry-requirements.txt"
-            " && poetry install --with test)"
+            " && poetry run pip install --quiet --no-deps -e .)"
             for library in ("langchain", "community")
         ),
     ),
@@ -750,7 +793,10 @@ RUN pip install --quiet uv \\
         f"""# offline package index for the sample's own scripts
 # wheelhouse sha256: {hashlib.sha256((wheelhouse or "").encode()).hexdigest()[:16]}
 COPY wheelhouse.sh /tmp/wheelhouse.sh
+# The requirements are resolved one set at a time, so a shared pip cache saves
+# the index round trips of every set (and of the next sample that needs them).
 RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
+    --mount=type=cache,target=/root/.cache/pip \
     bash /tmp/wheelhouse.sh
 """
         if wheelhouse is not None
@@ -810,6 +856,20 @@ RUN cd {SANDBOX_CODEBASE_DIR} \
 {wheelhouse_step}"""
 
 
+def _is_vulnerable_checkout(codebase: Path, commit: str) -> bool:
+    """Whether `codebase` already holds `commit` without local modifications."""
+    if not (codebase / ".git").is_dir():
+        return False
+    # the cache is shared between the accounts that run the evaluation, and git
+    # refuses a repository owned by another user
+    git = ["git", "-c", "safe.directory=*", "-C", str(codebase)]
+    head = run_host([*git, "rev-parse", "HEAD"])
+    if head.returncode != 0 or head.stdout.strip() != commit:
+        return False
+    status = run_host([*git, "status", "--porcelain"])
+    return status.returncode == 0 and not status.stdout.strip()
+
+
 def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -> str:
     """Build (once) the sandbox image of a sample, with the repository installed.
 
@@ -849,7 +909,11 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
 
     # The checkout comes from the pruned mirror: for local tasks it becomes the
     # git history of the sandbox, so it must not reference the bounty fixes.
-    checkout_codebase(ensure_sandbox_mirror(spec), spec.vulnerable_commit, codebase)
+    # Re-cloning an existing checkout changes the bytes of `COPY codebase` and so
+    # re-runs every step after it, so it only happens when the copy is missing or
+    # does not hold the vulnerable commit anymore.
+    if not _is_vulnerable_checkout(codebase, spec.vulnerable_commit):
+        checkout_codebase(ensure_sandbox_mirror(spec), spec.vulnerable_commit, codebase)
     ensure_agent_image()
     context.mkdir(parents=True, exist_ok=True)
     (context / "wheelhouse.sh").write_text(wheelhouse)
