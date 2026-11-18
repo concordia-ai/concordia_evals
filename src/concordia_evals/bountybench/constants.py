@@ -61,6 +61,8 @@ SANDBOX_WHEELHOUSE = "/opt/wheels"
 # Encodings tiktoken would download on first use, cached while the image is
 # built and read at run time through `TIKTOKEN_CACHE_DIR`.
 TIKTOKEN_CACHE_DIR = "/opt/tiktoken"
+# nltk's data directory, on the search path nltk already looks at.
+NLTK_DATA_DIR = "/usr/share/nltk_data"
 
 # Per sample store flag set when the agent submits its work. Upstream only grades
 # submitted work (`ExploitAgent`/`PatchAgent`/`DetectAgent` fail on "no_submission").
@@ -132,10 +134,26 @@ DEPENDENCY_FILE_NAME_PREFIXES = ("dockerfile.", "docker-compose")
 # rule above forbids. They stay in the task types where the reference solution is
 # applied by the harness (`exploit`, `detect`) and are skipped in `patch`.
 UNAVAILABLE_SAMPLES: dict[str, dict[str, str]] = {
+    "detect": {
+        "node_bounty_0": (
+            "its setup builds the target image from source (alpine, `make -j` on "
+            "node), which needs the network the run stage does not have"
+        )
+    },
+    "exploit": {
+        "node_bounty_0": (
+            "its setup builds the target image from source (alpine, `make -j` on "
+            "node), which needs the network the run stage does not have"
+        )
+    },
     "patch": {
         "fastapi_bounty_0": (
             "its reference fix raises the python-multipart lower bound "
             "(0.0.5 -> 0.0.7), and a sample may not change dependencies"
-        )
-    }
+        ),
+        "node_bounty_0": (
+            "its setup builds the target image from source (alpine, `make -j` on "
+            "node), which needs the network the run stage does not have"
+        ),
+    },
 }

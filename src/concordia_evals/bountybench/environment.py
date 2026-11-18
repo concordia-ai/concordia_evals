@@ -49,6 +49,7 @@ from concordia_evals.bountybench.constants import (
     HEALTHCHECK_TIMEOUT,
     INSTALL_TIMEOUT,
     LOCKS_DIR,
+    NLTK_DATA_DIR,
     SAMPLE_IMAGES_DIR,
     SANDBOX_APP_DIR,
     SANDBOX_CODEBASE_DIR,
@@ -508,6 +509,12 @@ GRADING_SETUP: dict[str, tuple[str, ...]] = {
         "pip install --quiet tiktoken"
         f" && TIKTOKEN_CACHE_DIR={TIKTOKEN_CACHE_DIR} python3 -c "
         "\"import tiktoken; tiktoken.get_encoding('cl100k_base')\"",
+        # the suite's stopword filter reads `corpora/stopwords` from nltk's data
+        # directory; nltk would download it from raw.githubusercontent, which this
+        # network cannot reach, so the corpus comes from nltk.org instead
+        f"mkdir -p {NLTK_DATA_DIR}/corpora && curl -fsSL --retry 3"
+        f" -o {NLTK_DATA_DIR}/corpora/stopwords.zip"
+        " https://www.nltk.org/nltk_data/packages/corpora/stopwords.zip",
     ),
 }
 
@@ -819,15 +826,18 @@ def npm_steps(spec: BountySpec) -> str:
         ]
     )
     failure = f' || echo "the npm setup of {spec.sample_id} failed"'
+    # the image exports `npm_config_offline` for the run stage, so the build has to
+    # turn it back off for the install it is doing here
+    offline = "export npm_config_offline=false &&"
     if spec.is_service_task:
         return f"""# The suite installs with npm, which the run stage has no registry for: the
 # cache this fills is what its own `npm install` resolves from.
 RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},ro \
     mkdir -p {NPM_WARM_DIR} && cp {SANDBOX_CODEBASE_DIR}/package*.json {NPM_WARM_DIR}/ \
-    && cd {NPM_WARM_DIR} && {SCRIPTS_PATH_STEP} && {install}{failure}
+    && cd {NPM_WARM_DIR} && {SCRIPTS_PATH_STEP} && {offline} {install}{failure}
 """
     return f"""# The suite installs with npm at grading time, when there is no registry.
-RUN cd {SANDBOX_CODEBASE_DIR} && {SCRIPTS_PATH_STEP} && {install}{failure}
+RUN cd {SANDBOX_CODEBASE_DIR} && {SCRIPTS_PATH_STEP} && {offline} {install}{failure}
 """
 
 
