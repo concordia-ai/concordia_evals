@@ -18,17 +18,39 @@ logger = logging.getLogger(__name__)
 
 VENDOR_DIR = Path(__file__).parent / "vendor"
 
-# Mirrors upstream scripts/install_validate_deps.sh.
+# Mirrors upstream scripts/install_validate_deps.sh, hardened for flaky
+# proxies: every network step tries the container proxy env first and falls
+# back to a direct connection (and vice versa). The host clash proxy on this
+# deployment flaps for minutes at a time and used to kill all in-flight
+# scorings during its outage windows.
 INSTALL_VALIDATE_DEPS = """
 set -e
+set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1
-curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+
+direct() { env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy "$@"; }
+fetch_sh() {
+  url="$1"
+  if curl -LsSf --connect-timeout 30 "$url" | sh; then return 0; fi
+  sleep 3
+  direct curl -LsSf --connect-timeout 30 "$url" | sh
+}
+run_uv() {
+  if uv "$@"; then return 0; fi
+  sleep 3
+  direct uv "$@"
+}
+
+fetch_sh https://astral.sh/uv/install.sh >/dev/null 2>&1
 . "$HOME/.local/bin/env"
-uv python install 3.13 >/dev/null 2>&1
-uv venv /scripts/.venv --python 3.13 >/dev/null 2>&1
-uv pip install --python /scripts/.venv/bin/python tomli >/dev/null 2>&1
+run_uv python install 3.13 >/dev/null 2>&1
+run_uv venv /scripts/.venv --python 3.13 >/dev/null 2>&1
+run_uv pip install --python /scripts/.venv/bin/python tomli >/dev/null 2>&1
 """
+
+# Number of attempts for the (now idempotent) validate-deps install step.
+INSTALL_VALIDATE_DEPS_ATTEMPTS = 2
 
 # Mirrors the arvo/cybergym image cleanup in upstream setup_workspace().
 ARVO_IMAGE_CLEANUP = """
@@ -88,7 +110,22 @@ def setup_workspace() -> Solver:
             "install sudo/git",
             timeout=900,
         )
-        await _exec(INSTALL_VALIDATE_DEPS, "install validate deps", timeout=1200)
+        last_err: RuntimeError | None = None
+        for attempt in range(INSTALL_VALIDATE_DEPS_ATTEMPTS):
+            try:
+                await _exec(INSTALL_VALIDATE_DEPS, "install validate deps", timeout=1200)
+                last_err = None
+                break
+            except RuntimeError as e:
+                last_err = e
+                logger.warning(
+                    "install validate deps attempt %d/%d failed: %s",
+                    attempt + 1,
+                    INSTALL_VALIDATE_DEPS_ATTEMPTS,
+                    e,
+                )
+        if last_err is not None:
+            raise last_err
 
         # validate.py is vendored in this package and deployed verbatim.
         validate_py = (VENDOR_DIR / "validate.py").read_bytes()

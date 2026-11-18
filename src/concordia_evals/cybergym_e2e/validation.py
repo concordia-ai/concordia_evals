@@ -21,6 +21,7 @@ from concordia_evals.cybergym_e2e.setup_solver import (
     APT_BYPASS_PROXY,
     ARVO_IMAGE_CLEANUP,
     INSTALL_VALIDATE_DEPS,
+    INSTALL_VALIDATE_DEPS_ATTEMPTS,
     VENDOR_DIR,
 )
 
@@ -142,7 +143,23 @@ def _setup_validation_container(
         "apt-get update -qq && apt-get install -y -qq sudo git >/dev/null 2>&1",
         timeout=900,
     )
-    _exec(container_id, INSTALL_VALIDATE_DEPS, timeout=1200)
+    last_err: RuntimeError | None = None
+    for attempt in range(INSTALL_VALIDATE_DEPS_ATTEMPTS):
+        try:
+            _exec(container_id, INSTALL_VALIDATE_DEPS, timeout=1200)
+            last_err = None
+            break
+        except RuntimeError as e:
+            last_err = e
+            logger.warning(
+                "install validate deps attempt %d/%d failed in %s: %s",
+                attempt + 1,
+                INSTALL_VALIDATE_DEPS_ATTEMPTS,
+                container_id[:12],
+                e,
+            )
+    if last_err is not None:
+        raise last_err
 
     _docker(["cp", str(VENDOR_DIR / "validate.py"), f"{container_id}:/scripts/validate.py"])
     if compile_timeout is not None:
