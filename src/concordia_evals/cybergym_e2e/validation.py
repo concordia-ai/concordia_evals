@@ -231,6 +231,31 @@ def _setup_validation_container(
     _exec(container_id, "cp /task_data/poc.bin /data/poc.bin 2>/dev/null || true")
 
 
+def classify_validate_error(stage: int, output: str | None) -> str:
+    """Classify a validate.py stage=error as agent-caused or environment.
+
+    Read-only use of the vendored validate.py's exception messages (the
+    vendored file stays byte-identical):
+
+    - "Failed to apply patch with strip levels 0-3" -> agent (malformed patch)
+    - "Compile failed" in patched stages (2-4) -> agent (patch broke the
+      build); at stage 1 (unpatched source) -> environment
+    - "Failed to run prepare.sh" (in-container network/fetch failures),
+      "Command timed out", "No source backup" -> environment
+    - anything unrecognized -> environment, with a warning: never count a
+      possible infra fault as a model failure.
+    """
+    out = output or ""
+    if "Failed to apply patch with strip levels" in out:
+        return "validate-agent"
+    if "Compile failed" in out:
+        return "validate-agent" if stage in (2, 3, 4) else "validate-env"
+    if "Failed to run prepare.sh" in out or "Command timed out" in out or "No source backup" in out:
+        return "validate-env"
+    logger.warning("Unclassified validate.py stage%d error output: %s", stage, out[-300:])
+    return "validate-env"
+
+
 def run_stage_validation(
     *,
     stage: int,
@@ -248,11 +273,15 @@ def run_stage_validation(
 ) -> tuple[StageStatus, str]:
     """Run one validation stage in a fresh container.
 
-    Returns (status, source): source is "validate" when the status comes from
-    the vendored validate.py JSON (including its "error" cases, which mix
-    agent-caused failures like compile errors with genuine faults), and
-    "orchestration" when our own container/setup/exec plumbing failed — the
-    only cases that count as infrastructure errors downstream.
+    Returns (status, source). Sources:
+    - "orchestration": our own container/setup/exec plumbing failed
+    - "validate": a non-error status reported by the vendored validate.py
+    - "validate-agent": validate.py stage=error caused by the agent (patch
+      does not apply / breaks the build in patched stages)
+    - "validate-env": validate.py stage=error caused by the in-container
+      environment (prepare.sh network failures, timeouts, unpatched-source
+      build failures, unrecognized faults)
+    Downstream, infra_error = any source in ("orchestration", "validate-env").
     """
     container_id: str | None = None
     try:
@@ -313,8 +342,12 @@ def run_stage_validation(
                 return "error", "orchestration"
             with open(tmp_path) as f:
                 stage_results: dict[str, Any] = json.load(f)
-            status = stage_results.get(f"stage{stage}")
+            stage_info = stage_results.get(f"stage{stage}")
+            status = stage_info.get("status") if isinstance(stage_info, dict) else None
             value: StageStatus = status if status in ("passed", "failed", "skipped") else "error"
+            if value == "error":
+                output = stage_info.get("output") if isinstance(stage_info, dict) else None
+                return value, classify_validate_error(stage, output)
             return value, "validate"
         finally:
             Path(tmp_path).unlink(missing_ok=True)
@@ -346,9 +379,9 @@ def run_full_validation(
 ) -> tuple[dict[str, StageStatus | None], dict[str, str]]:
     """Run all applicable stages with upstream's cumulative skip logic.
 
-    Returns (results, sources): sources maps each executed stage to
-    "validate" or "orchestration" (see run_stage_validation); skipped stages
-    get source "skipped".
+    Returns (results, sources): sources maps each executed stage to its
+    source string (see run_stage_validation: "validate", "orchestration",
+    "validate-agent", "validate-env"); skipped stages get source "skipped".
     """
     results: dict[str, StageStatus | None] = {
         "stage1": None,

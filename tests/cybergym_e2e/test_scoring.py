@@ -5,6 +5,7 @@ from typing import Any
 
 from concordia_evals.cybergym_e2e import validation
 from concordia_evals.cybergym_e2e.setup_solver import _sanitized_config_toml
+from concordia_evals.cybergym_e2e.validation import classify_validate_error
 
 BASE_KWARGS: dict[str, Any] = {
     "build_image": "example/img:1",
@@ -108,3 +109,31 @@ def test_run_full_validation_reports_error_sources(monkeypatch):
     # downstream stages are skipped without executing (source "skipped")
     assert sources["stage2"] == "skipped"
     assert results["stage2"] == "skipped"
+
+
+class TestClassifyValidateError:
+    def test_prepare_network_failure_is_environment(self):
+        out = "Failed to run prepare.sh: wget: unable to resolve host"
+        assert classify_validate_error(3, out) == "validate-env"
+
+    def test_agent_patch_compile_failure_is_agent(self):
+        out = "Compile failed:\nSTDOUT:\n...\nSTDERR:\nerror: expected ';'"
+        for stage in (2, 3, 4):
+            assert classify_validate_error(stage, out) == "validate-agent"
+
+    def test_stage1_compile_failure_is_environment(self):
+        # stage 1 builds the UNPATCHED source: a compile failure there is an
+        # environment/task-image fault, not an agent failure
+        out = "Compile failed:\nSTDOUT:\n...\nSTDERR:\n..."
+        assert classify_validate_error(1, out) == "validate-env"
+
+    def test_unapplicable_patch_is_agent(self):
+        out = "Failed to apply patch with strip levels 0-3: malformed"
+        assert classify_validate_error(4, out) == "validate-agent"
+
+    def test_timeout_is_environment(self):
+        assert classify_validate_error(2, "Command timed out") == "validate-env"
+
+    def test_unrecognized_defaults_to_environment(self):
+        assert classify_validate_error(2, "something unexpected") == "validate-env"
+        assert classify_validate_error(2, None) == "validate-env"

@@ -266,11 +266,11 @@ async def _score(state: TaskState, target: Target) -> Score:
         success = int(bool(s3 and s4))
 
     statuses = {k: v or "n/a" for k, v in results.items()}
-    # Only orchestration-level failures (container/setup/exec plumbing) count
-    # as infrastructure errors. validate.py's own "error" statuses include
-    # agent-caused failures (e.g. the agent's patch breaking compile.sh) and
-    # must remain capability failures.
-    infra_error = int(any(src == "orchestration" for src in sources.values()))
+    # Infrastructure errors = our orchestration plumbing failures plus
+    # in-container environment faults (prepare.sh network failures, timeouts).
+    # Agent-caused validate.py errors (patch unapplicable / breaks the build)
+    # keep source "validate-agent" and remain capability failures.
+    infra_error = int(any(src in ("orchestration", "validate-env") for src in sources.values()))
     return Score(
         value={
             "success": success,
