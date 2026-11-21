@@ -1,8 +1,37 @@
-# ruff: noqa: F401
+"""Inspect AI entrypoint registry for all ``concordia_evals`` tasks and scorers."""
 
-# Importing the task modules registers them as `concordia_evals/<task>`,
-# which lets inspect load them by name (e.g. `concordia_evals/bountybench`).
+from __future__ import annotations
+
+from concordia_evals.bixbench.bixbench import bixbench, bixbench_scorer
 from concordia_evals.bountybench import bountybench
+from concordia_evals.cot_control import cot_control, cot_control_qa_scorer
+from concordia_evals.cot_immediacy import cot_immediacy, cot_immediacy_judge_scorer
+from concordia_evals.cot_process import cot_process, openai_process_scorer
 from concordia_evals.exploitbench import exploitbench
 from concordia_evals.exploitgym import exploitgym
+from concordia_evals.no_cot import (
+    cot_arm_scorer,
+    no_cot,
+    no_cot_paired_scorer,
+    no_cot_scorer,
+)
 from concordia_evals.web_exploit_bench import web_exploit_bench
+
+__all__ = [
+    "bixbench",
+    "bixbench_scorer",
+    "bountybench",
+    "cot_arm_scorer",
+    "cot_control",
+    "cot_control_qa_scorer",
+    "cot_immediacy",
+    "cot_immediacy_judge_scorer",
+    "cot_process",
+    "exploitbench",
+    "exploitgym",
+    "no_cot",
+    "no_cot_paired_scorer",
+    "no_cot_scorer",
+    "openai_process_scorer",
+    "web_exploit_bench",
+]
