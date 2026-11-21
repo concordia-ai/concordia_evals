@@ -3,27 +3,31 @@ name = "concordia-evals"
 version = "0.1.0"
 description = "Inspect-native evaluations maintained by Concordia AI"
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.10"
+license = "MIT AND Apache-2.0"
+license-files = ["NOTICE"]
+requires-python = ">=3.11"
 authors = [
     { name = "Concordia AI" },
 ]
 keywords = ["inspect", "eval", "concordia"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "inspect_ai >= 0.3.221",
+    "inspect_ai >= 0.3.287",
+    "inspect-evals >= 0.29.0",
     "datasets >= 4.8.5",
     "huggingface-hub >= 1.2.0",
     "docker",
+    "filelock >= 3.15",
+    "openai >= 3.4.0",
+    "pandas >= 2.0",
     "platformdirs",
+    "pyyaml >= 6.0",
 ]
 
 [project.optional-dependencies]
@@ -38,15 +42,18 @@ dev = [
 Homepage = "https://github.com/concordia-ai/concordia_evals"
 Repository = "https://github.com/concordia-ai/concordia_evals"
 
+[project.entry-points.inspect_ai]
+concordia_evals = "concordia_evals._registry"
+
 [build-system]
-requires = ["setuptools>=61.0", "setuptools_scm[toml]>=8.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
@@ -58,6 +65,7 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["PLR2004"]
+"src/concordia_evals/cot_control/_reference/**/*" = ["D", "PLR2004"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -77,7 +85,21 @@ ignore_missing_imports = true
 module = ["datasets", "datasets.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = [
+    "inspect_evals",
+    "inspect_evals.*",
+    "inspect_evals_utils",
+    "inspect_evals_utils.*",
+    "yaml",
+    "filelock",
+    "pandas",
+    "pandas.*",
+]
+ignore_missing_imports = true
+
 [tool.setuptools.package-data]
+"*" = ["README.md"]
 "concordia_evals.bixbench" = ["Dockerfile"]
 
 [tool.pytest.ini_options]
