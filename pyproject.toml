@@ -20,7 +20,11 @@ classifiers = [
 dependencies = [
     "inspect_ai >= 0.3.287",
     "inspect-evals >= 0.29.0",
-    "datasets >= 4.8.5",
+    # only load_dataset(..., revision=...) and the datasets.Dataset/Image /
+    # concatenate_datasets helpers are used, all of which predate 4.x by far. a
+    # high floor here forces an upgrade of datasets (and therefore pyarrow)
+    # inside an existing environment that already works.
+    "datasets >= 2.19",
     "huggingface-hub >= 1.2.0",
     # pyarrow (pulled in by datasets) refuses numpy 1.x at runtime but declares
     # no numpy requirement, so a resolution can land on pyarrow>=24 + numpy 1.x
