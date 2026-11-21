@@ -73,7 +73,7 @@ def setup_bountybench() -> Solver:
         # running.
         lock = await asyncio.to_thread(acquire_stack_lock, spec.system)
         try:
-            workspace = Workspace.create(spec, lock=lock)
+            workspace = await asyncio.to_thread(Workspace.create, spec, lock=lock)
         except Exception:
             release_stack_lock(lock)
             raise
@@ -86,8 +86,13 @@ def setup_bountybench() -> Solver:
             await init_sandbox(sbx, spec)
             # Upstream always runs the setup scripts (no-ops for systems that are
             # not docker compose services); `detect` binds no bounty setup
-            # resource.
-            workspace.start(bounty_setup=state.metadata["task_type"] != "detect")
+            # resource. Building the stack images takes tens of minutes and is
+            # blocking, so it runs in a thread: blocking the event loop here would
+            # freeze every other sample and task in this process (their sandbox
+            # operations and even their time limit monitors).
+            await asyncio.to_thread(
+                workspace.start, bounty_setup=state.metadata["task_type"] != "detect"
+            )
 
             # The task prompt embeds a listing of the agent workspace, which only
             # exists once the sandbox is up (upstream builds it per phase too).
@@ -95,7 +100,7 @@ def setup_bountybench() -> Solver:
         except Exception:
             # A stack that failed to come up would keep the fixed container names
             # of the system busy for every later sample.
-            workspace.stop()
+            await asyncio.to_thread(workspace.stop)
             raise
         state.messages[0] = ChatMessageUser(
             content=render_prompt(state.input_text, codebase=listing)

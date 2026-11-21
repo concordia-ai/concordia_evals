@@ -174,6 +174,54 @@ def image_exists(tag: str) -> bool:
     return run_host(["docker", "image", "inspect", tag]).returncode == 0
 
 
+# Recorded in every image this module builds. The docker daemon is shared by every
+# account on the host, so an image built once is reused by all of them: the label
+# says which recipe built it, and no account specific stamp file is needed.
+RECIPE_LABEL = "concordia.recipe"
+
+
+def recipe_digest(recipe: str) -> str:
+    """Identifier of a build recipe, recorded in the image it builds."""
+    return hashlib.sha256(recipe.encode()).hexdigest()
+
+
+def image_recipe(image: str) -> str | None:
+    """Digest of the recipe that built an image, `None` when it has no label."""
+    inspected = run_host(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            f'{{{{index .Config.Labels "{RECIPE_LABEL}"}}}}',
+            image,
+        ]
+    )
+    value = inspected.stdout.strip()
+    return None if inspected.returncode != 0 or value in ("", "<no value>") else value
+
+
+def image_id(tag: str) -> str:
+    """Id of an image, `""` when it is missing."""
+    inspected = run_host(["docker", "image", "inspect", "--format", "{{.Id}}", tag])
+    return inspected.stdout.strip() if inspected.returncode == 0 else ""
+
+
+def built_from(image: str, recipe: str, stamp: Path | None = None) -> bool:
+    """Whether the image of `recipe` is already there and can be reused.
+
+    `stamp` is the recipe of an image built before the label was introduced: it
+    lives in the cache of the account that built it, so it only answers for that
+    account, while the label answers for every account of the docker daemon.
+    """
+    if not image_exists(image):
+        return False
+    recorded = image_recipe(image)
+    if recorded is not None:
+        return recorded == recipe_digest(recipe)
+    return stamp is not None and stamp.exists() and stamp.read_text() == recipe
+
+
 def ensure_agent_image(tag: str = AGENT_IMAGE) -> None:
     """Build the base sandbox image (Kali + toolchain) if it is missing."""
     if image_exists(tag):
@@ -253,6 +301,21 @@ def _without_cpython_build(command: str) -> str:
             *steps[cleanup + 1 :],
         ]
     )
+
+
+def install_python_version(install_command: str | None) -> str | None:
+    """Interpreter the metadata installs the checkout with, if not the default.
+
+    Some task metadata files pin a newer interpreter than the image's 3.9
+    (`python3.11 -m pip install -e .`), and their suite then runs the checkout
+    with `python`: the image installs that interpreter and points `python` at it,
+    otherwise the install fails on `requires-python` and the suite imports
+    nothing.
+    """
+    match = re.search(r"\bpython(3\.\d+)\b", install_command or "")
+    if match is None or match.group(1) == DEFAULT_PYTHON:
+        return None
+    return match.group(1)
 
 
 def install_script(
@@ -443,6 +506,16 @@ GRADING_PIP: dict[str, tuple[str, ...]] = {
     # pip-tools, so without it the suite has no requirements file to install
     # from and reports no invariant score at all.
     "gradio": ("pip-tools",),
+    # the suite runs with `filterwarnings = error`, and `pyparsing` 3.3 deprecates
+    # `parseString`, which `matplotlib<3.8` still calls: pytest aborts while it
+    # loads `conftest.py` and reports no score at all. The wheelhouse holds only
+    # the release below the deprecation.
+    "astropy": ("pyparsing<3.3",),
+    # the suite builds the checkout with the 3.10 interpreter, and the checkout
+    # itself requires `numpy<2` at that commit: the wheelhouse has the build
+    # requirement (`numpy>=1.25`, resolved to 2.x) but not a 1.x wheel the install
+    # can pick
+    "scikit-learn": ("numpy<2",),
 }
 
 # Interpreters the bounties create their test virtualenvs with. Kali ships 3.9
@@ -477,6 +550,11 @@ GRADING_ENV: dict[str, tuple[tuple[str, str], ...]] = {
     # tiktoken downloads the `cl100k_base` table on first use; the run stage is
     # offline, so it reads it from the copy the image caches instead.
     "llama_index": (("TIKTOKEN_CACHE_DIR", TIKTOKEN_CACHE_DIR),),
+    # the suite builds the checkout again inside its own virtualenv, where the
+    # `CFLAGS` of the dataset's install command are not set: GCC 14 of the image
+    # makes the `-Wincompatible-pointer-types` the generated C code raises fatal
+    # (`PyArray_DATA(PyObject *)` in `wcslib`'s wrappers aborts the build).
+    "astropy": (("CFLAGS", "-Wno-error=incompatible-pointer-types -Wno-error"),),
 }
 
 GRADING_SETUP: dict[str, tuple[str, ...]] = {
@@ -498,9 +576,25 @@ GRADING_SETUP: dict[str, tuple[str, ...]] = {
             for library in ("langchain", "community")
         ),
     ),
+    # `python setup.py easy_install ...` is the suite's healthcheck: it resolves
+    # requirements itself, from sdists, and knows nothing about pip's environment
+    "setuptools": (
+        "printf '[easy_install]\\nfind_links = %s\\n' "
+        + SANDBOX_WHEELHOUSE
+        + " > /root/.pydistutils.cfg",
+    ),
     # the IDN tests of the suite run under the locale they name, which the image
     # has to generate or the checks fall back to ASCII
     "curl": ("sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen",),
+    # one of the suite's three tests reads a demo dataset that the library
+    # downloads on first use; the archive is fetched here, so that the download
+    # finds the file and only unpacks it (`download()` skips an existing file)
+    "gluon-cv": (
+        "mkdir -p /root/.gluoncv/archive && curl -fsSL --retry 3"
+        " --speed-limit 1000 --speed-time 60"
+        " -o /root/.gluoncv/archive/tiny_motorbike.zip"
+        " https://autogluon.s3.amazonaws.com/datasets/tiny_motorbike.zip",
+    ),
     # importing `llama_index.utils` (the tests do it while they are collected)
     # builds a tokenizer, which makes tiktoken fetch the `cl100k_base` table from
     # openaipublic: without the download the whole suite fails to collect, so it
@@ -516,6 +610,41 @@ GRADING_SETUP: dict[str, tuple[str, ...]] = {
         f" -o {NLTK_DATA_DIR}/corpora/stopwords.zip"
         " https://www.nltk.org/nltk_data/packages/corpora/stopwords.zip",
     ),
+}
+
+# Interpreter the image provides as `python`, as upstream's Kali image does.
+DEFAULT_PYTHON = "3.9"
+
+# Systems whose grading builds the checkout from a script that lives *inside* it,
+# which `grading_requirements` cannot read: their build requirements are added to
+# the wheelhouse even though no script of the task installs the checkout.
+GRADING_BUILD_REQUIREMENTS: tuple[str, ...] = ("gradio",)
+
+# Pinned requirement files of a checkout that the sample's grading resolves
+# against. `gradio` runs `pip-compile` on `test/requirements.in` inside the
+# checkout; pip-compile keeps the pins of the committed output file, so having
+# exactly those in the wheelhouse is enough for it to resolve offline.
+GRADING_REQUIREMENT_FILES: dict[str, tuple[str, ...]] = {
+    # the suite installs the test tree the first file pins, and `authlib` (which
+    # `install_test_requirements.sh` installs from the second) is named nowhere in
+    # the task's own scripts
+    "gradio": ("test/requirements.txt", "requirements-oauth.txt"),
+}
+
+# Requirement files of a checkout whose *pinned* lines the grading needs on top of
+# the ones above: the committed output file of `gradio` is older than its input,
+# which pins `gradio_pdf==0.0.3` (the release the suite imports).
+GRADING_REQUIREMENT_PINS: dict[str, tuple[str, ...]] = {
+    "gradio": ("test/requirements.in",),
+}
+
+# Requirements `easy_install` resolves at grading time. It only installs from
+# sdists and ignores pip's environment, so those come as source archives and its
+# own configuration points at the wheelhouse (`GRADING_SETUP`).
+GRADING_SDISTS: dict[str, tuple[str, ...]] = {
+    # the dependencies of the `requests` the mirror exposes (see `GIT_MIRRORS`);
+    # `chardet` and `idna` 2.x are the last releases that still ship a `setup.py`
+    "setuptools": ("certifi", "chardet<5", "idna<3", "urllib3<2"),
 }
 
 GRADING_PYTHONS: dict[str, tuple[str, ...]] = {
@@ -537,6 +666,20 @@ NPM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 
 for _system in NPM_DEPENDENCIES:
     GRADING_ENV[_system] = (("npm_config_offline", "true"),)
+
+# Repositories the sample's own grading clones from github, which the run stage
+# cannot reach. They are cloned while the image is built, and `git` rewrites the
+# github URL to the local mirror.
+# (repository, the revision the mirror exposes as `main`). A branch is pinned when
+# its current dependencies cannot be installed without an index: `easy_install`
+# builds every requirement from an sdist, and `idna` (a dependency of requests)
+# has shipped no `setup.py` since 3.x.
+GIT_MIRRORS: dict[str, tuple[tuple[str, str], ...]] = {
+    # `python setup.py easy_install "git+https://github.com/psf/requests.git@main"`
+    # is the healthcheck of the suite
+    "setuptools": (("psf/requests", "v2.25.1"),),
+}
+GIT_MIRROR_DIR = "/opt/git-mirrors"
 
 # Scripts a sample runs while it is prepared and graded, and that install
 # packages with pip while doing it.
@@ -574,6 +717,9 @@ _PIP_FLAGS_WITH_VALUE = {
 # `>`, `>>`, `2>&1`, `/dev/null`: shell redirections a pip line may carry.
 # `numpy<2` is a version specifier and must not be mistaken for one.
 _REDIRECTION = re.compile(r"\d*[<>]&?\d*|&>\S*|/dev/null|\d*>\S*")
+# `pip install -e . && pip install pytest`: the rest of the shell line is not a
+# package, and `&&` would otherwise be collected as one
+_SHELL_OPERATOR = re.compile(r"[|&;]+")
 _PIP_FLAGS_WITHOUT_VALUE = {
     "-q",
     "--quiet",
@@ -610,9 +756,13 @@ def grading_requirements(spec: BountySpec) -> tuple[list[str], list[str]]:
         if not script.exists():
             continue
         text = script.read_text(errors="replace").replace("\\\n", " ")
-        for line in text.splitlines():
-            match = _PIP_INSTALL.match(line)
-            if not match or line.lstrip().startswith("#"):
+        # `pip install -e . && pip install pytest` is two installs: splitting the
+        # line keeps the second command's own `pip install` out of the arguments
+        for line, command in (
+            (line, command) for line in text.splitlines() for command in _SHELL_OPERATOR.split(line)
+        ):
+            match = _PIP_INSTALL.match(command)
+            if not match or command.lstrip().startswith("#"):
                 continue
             tokens = shlex.split(match.group(1), comments=True)
             index = 0
@@ -652,6 +802,28 @@ def grading_requirements(spec: BountySpec) -> tuple[list[str], list[str]]:
                 else:
                     requirements.add(token)
     return sorted(requirements), sorted(local)
+
+
+def build_requirements(spec: BountySpec) -> list[str]:
+    """Requirements the checkout's build system declares for itself.
+
+    The sample's own scripts build the checkout again inside a virtualenv while
+    it is graded, offline: without the declarations of `pyproject.toml` (`cmake`,
+    `meson-python`, the Cython the C code is generated from) that build cannot
+    even start. Read from the mirror, because the checkout is cloned only after
+    the wheelhouse is resolved.
+    """
+    mirror = ensure_codebase_mirror(spec)
+    shown = run_host(["git", "show", f"{spec.vulnerable_commit}:pyproject.toml"], cwd=mirror)
+    if shown.returncode != 0:
+        return []
+    section = re.search(r"^\[build-system\](.*?)(?=^\[|\Z)", shown.stdout, re.S | re.M)
+    if section is None:
+        return []
+    requires = re.search(r"requires\s*=\s*\[(.*?)\]", section.group(1), re.S)
+    if requires is None:
+        return []
+    return re.findall(r"[\"']([^\"']+)[\"']", requires.group(1))
 
 
 def _requirement_file(path: str, script_dir: Path, spec: BountySpec) -> Path | None:
@@ -752,7 +924,12 @@ def codebase_relative(path: str) -> str:
 
 
 def wheelhouse_script(
-    requirements: list[str], local: list[str], python_versions: tuple[str, ...] = ()
+    requirements: list[str],
+    local: list[str],
+    python_versions: tuple[str, ...] = (),
+    sdists: tuple[str, ...] = (),
+    requirement_sets: tuple[tuple[str, list[str]], ...] = (),
+    frozen: bool = False,
 ) -> str:
     """Script that fills `/opt/wheels` while the image is built.
 
@@ -798,6 +975,33 @@ def wheelhouse_script(
             f'|| echo "MISSING {version} {requirement}"'
             for requirement in extra
         )
+    for name, pinned in requirement_sets:
+        # A pinned file is resolved as a set: those pins are consistent with each
+        # other (pip-compile wrote them), which a set built from the scripts'
+        # requirements is not, and a pin can be an sdist the `--only-binary` pass
+        # above cannot see.
+        lines.append(f"cat > /tmp/{name} <<'REQUIREMENTS'")
+        lines.extend(pinned)
+        lines.append("REQUIREMENTS")
+        lines.append(
+            f"pip download -q -d {SANDBOX_WHEELHOUSE} -r /tmp/{name} "
+            f'|| echo "MISSING the requirements of {name}"'
+        )
+    if frozen:
+        # the suite builds the checkout into a virtualenv of its own, and a
+        # project can pull a dependency tree that no script of the task names:
+        # what the image installed is that list
+        lines.append(
+            f"pip freeze --exclude-editable > /tmp/frozen.txt "
+            f"&& pip download -q -d {SANDBOX_WHEELHOUSE} -r /tmp/frozen.txt "
+            '|| echo "MISSING the frozen environment"'
+        )
+    for requirement in sdists:
+        # `easy_install` installs sdists only, and skips an installed requirement
+        lines.append(
+            f"pip download -q --no-binary=:all: -d {SANDBOX_WHEELHOUSE} "
+            f'{shlex.quote(requirement)} || echo "MISSING {requirement}"'
+        )
     for path in local:
         target = codebase_relative(path)
         lines.append(
@@ -841,6 +1045,27 @@ RUN cd {SANDBOX_CODEBASE_DIR} && {SCRIPTS_PATH_STEP} && {offline} {install}{fail
 """
 
 
+def git_mirrors(spec: BountySpec) -> str:
+    """Clone into the image the repositories the sample's grading clones itself.
+
+    The clone happens while the scripts run, when there is no network: `git`
+    rewrites the github URL to the copy in the image.
+    """
+    repositories = GIT_MIRRORS.get(spec.system)
+    if not repositories:
+        return ""
+    clones = " \\\n    && ".join(
+        f"git clone --quiet --bare https://github.com/{name} {GIT_MIRROR_DIR}/{name}.git"
+        f" && git -C {GIT_MIRROR_DIR}/{name}.git update-ref refs/heads/main {ref}"
+        for name, ref in repositories
+    )
+    return f"""# The suite clones from github while it is graded, when there is no network.
+RUN mkdir -p {GIT_MIRROR_DIR} \\
+    && {clones} \\
+    && git config --system url."file://{GIT_MIRROR_DIR}/".insteadOf https://github.com/
+"""
+
+
 def sample_recipe(spec: BountySpec, command: str | None, wheelhouse: str | None) -> str:
     """Dockerfile of the sandbox image of a sample.
 
@@ -851,7 +1076,10 @@ def sample_recipe(spec: BountySpec, command: str | None, wheelhouse: str | None)
     keep the image small: their checkout is mounted only for the install.
     """
     tools = " ".join(GRADING_TOOLS.get(spec.system, ()))
+    install_python = install_python_version(command)
     pythons = GRADING_PYTHONS.get(spec.system, ())
+    if install_python is not None:
+        pythons = (*pythons, install_python)
     tools_step = ""
     if tools:
         tools_step += f"""# host tools the sample's own scripts would install while grading; the
@@ -865,11 +1093,18 @@ RUN apt-get update && apt-get install -y {tools}
             f"/usr/local/bin/python{version}"
             for version in pythons
         )
+        default_links = ""
+        if install_python is not None:
+            default_links = (
+                f" && ln -sf /usr/local/bin/python{install_python} /usr/local/bin/python3"
+                f" && ln -sf /usr/local/bin/python{install_python} /usr/local/bin/python"
+            )
         tools_step += f"""# interpreter the bounty suite hardcodes for its test virtualenv
 RUN pip install --quiet uv \\
     && {SCRIPTS_LOOKUP} \\
-    && {python_installs}
+    && {python_installs}{default_links}
 """
+    tools_step += git_mirrors(spec)
     wheelhouse_step = (
         f"""# offline package index for the sample's own scripts
 # wheelhouse sha256: {hashlib.sha256((wheelhouse or "").encode()).hexdigest()[:16]}
@@ -884,7 +1119,7 @@ RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
         else ""
     )
     grading_env = "".join(
-        f"ENV {name}={value}\n" for name, value in GRADING_ENV.get(spec.system, ())
+        f'ENV {name}="{value}"\n' for name, value in GRADING_ENV.get(spec.system, ())
     )
     grading = "".join(
         f"""# Part of what the sample's own grading expects, done here because the run
@@ -919,7 +1154,7 @@ RUN cd {SANDBOX_CODEBASE_DIR} && {command} \
         else ""
     )
     grading_env = "".join(
-        f"ENV {name}={value}\n" for name, value in GRADING_ENV.get(spec.system, ())
+        f'ENV {name}="{value}"\n' for name, value in GRADING_ENV.get(spec.system, ())
     )
     grading = "".join(
         f"""# Part of what the sample's own grading expects, done here because the run
@@ -977,12 +1212,40 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     # the offline index of its grading requirements.
     requirements, local = grading_requirements(spec)
     requirements = [*requirements, *GRADING_PIP.get(spec.system, ())]
+    if local or spec.system in GRADING_BUILD_REQUIREMENTS:
+        requirements += build_requirements(spec)
+    requirement_sets = tuple(
+        (Path(name).name, sorted(_requirements_in_checkout(spec, name)))
+        for name in GRADING_REQUIREMENT_FILES.get(spec.system, ())
+    ) + tuple(
+        (
+            Path(name).name,
+            sorted(
+                requirement
+                for requirement in _requirements_in_checkout(spec, name)
+                if "==" in requirement
+            ),
+        )
+        for name in GRADING_REQUIREMENT_PINS.get(spec.system, ())
+    )
     # the invariant suites install the checkout itself (`-e .`), so the
     # dependencies of the project have to be in the wheelhouse as well
+    # the interpreter the suite runs the checkout with needs its own wheels: a
+    # requirement of a package there can be newer than what the default
+    # interpreter resolves to
+    install_python = install_python_version(spec.repo_metadata.get("install_command"))
+    python_versions = GRADING_PYTHONS.get(spec.system, ())
+    if install_python is not None:
+        python_versions = (*python_versions, install_python)
     wheelhouse = wheelhouse_script(
         requirements,
         sorted({".", *local}),
-        GRADING_PYTHONS.get(spec.system, ()),
+        python_versions,
+        GRADING_SDISTS.get(spec.system, ()),
+        requirement_sets,
+        # a suite that builds the checkout in its own virtualenv needs the
+        # project's whole tree, which only the installed image knows
+        frozen=bool(local),
     )
     dockerfile = context / AGENT_DOCKERFILE
 
@@ -996,9 +1259,13 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     # The stamp is written after a successful build: an interrupted one leaves the
     # dockerfile of the new recipe next to the image of the old one.
     stamp = context / "build.stamp"
-    if image_exists(tag) and codebase.exists() and stamp.exists():
-        if stamp.read_text() == sample_recipe(spec, install(), wheelhouse):
-            return tag
+    recipe = sample_recipe(spec, install(), wheelhouse)
+    if built_from(tag, recipe, stamp):
+        # the grading mounts the checkout, so it has to be there even when the
+        # image itself comes from the cache of another account of the daemon
+        if not _is_vulnerable_checkout(codebase, spec.vulnerable_commit):
+            checkout_codebase(ensure_sandbox_mirror(spec), spec.vulnerable_commit, codebase)
+        return tag
 
     # The checkout comes from the pruned mirror: for local tasks it becomes the
     # git history of the sandbox, so it must not reference the bounty fixes.
@@ -1010,7 +1277,7 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
     ensure_agent_image()
     context.mkdir(parents=True, exist_ok=True)
     (context / "wheelhouse.sh").write_text(wheelhouse)
-    dockerfile.write_text(sample_recipe(spec, install(), wheelhouse))
+    dockerfile.write_text(f'{recipe}\nLABEL {RECIPE_LABEL}="{recipe_digest(recipe)}"\n')
     logger.info(f"Building the sandbox image {tag} ({spec.sample_id})")
     built = run_host(
         [
@@ -1029,7 +1296,7 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
             f"Unable to build the sandbox image of {spec.sample_id}: "
             f"{built.stderr.strip()[-2_000:]}"
         )
-    stamp.write_text(sample_recipe(spec, install(), wheelhouse))
+    stamp.write_text(recipe)
     return tag
 
 
@@ -1402,9 +1669,8 @@ class Workspace:
             dockerfile = _map_to_pristine(build.dockerfile, self.root, pristine)
             stamp_path = COMPOSE_IMAGE_DIR / f"{self.spec.sample_id}-{service}.dockerfile"
             recipe = dockerfile.read_text()
-            if image_exists(build.image) and stamp_path.exists():
-                if stamp_path.read_text() == recipe:
-                    continue
+            if built_from(build.image, recipe, stamp_path):
+                continue
             pull_base_images(build.dockerfile)
             logger.info(f"Building the image of {service} of {self.spec.sample_id}")
             built = run_host(
@@ -1413,6 +1679,8 @@ class Workspace:
                     "build",
                     "--tag",
                     build.image,
+                    "--label",
+                    f"{RECIPE_LABEL}={recipe_digest(recipe)}",
                     "--file",
                     str(_map_to_pristine(build.dockerfile, self.root, pristine)),
                     str(_map_to_pristine(build.context, self.root, pristine)),
@@ -1818,6 +2086,12 @@ class Workspace:
                 name,
                 "--volume",
                 f"{self.root}:{self.root}",
+                # the image installs the checkout with `pip install -e .` from
+                # `/app/codebase`, a mount that exists only while it is built, and
+                # the suite imports the project: the mount is repeated here so
+                # that the import resolves to the patched checkout
+                "--volume",
+                f"{self.codebase}:{SANDBOX_CODEBASE_DIR}",
                 "--volume",
                 f"{COMPOSE_OVERRIDES_DIR}:{COMPOSE_OVERRIDES_DIR}",
                 "--volume",
@@ -1994,14 +2268,15 @@ class BuildFix:
     """Adaptations for a bounty whose own `Dockerfile` no longer builds.
 
     `constraints` pin a package that the Dockerfile installs unpinned and whose
-    current release broke it; `hosts` replace a package host that stopped serving
-    the distribution the sample pins (a distro that reached end of life).
+    current release broke it; `replace` rewrites text of the `Dockerfile`s (a
+    package host that stopped serving the distribution the sample pins, or a
+    package the current base image renamed).
     `apt_conf` is written to the image before its first `apt-get update`, for the
     package manager options those replacements need.
     """
 
     constraints: tuple[str, ...] = ()
-    hosts: tuple[tuple[str, str], ...] = ()
+    replace: tuple[tuple[str, str], ...] = ()
     apt_hosts: tuple[tuple[str, str], ...] = ()
     # (substring of a RUN line) -> refresh the package lists before that line:
     # the base image bakes lists that name versions no mirror serves any more
@@ -2035,7 +2310,7 @@ BUILD_FIXES: dict[str, BuildFix] = {
     # removed from its pool, and `bullseye-pgdg` moved to the archive (the
     # `groonga` source package writes that repository into the image itself)
     "lunary": BuildFix(
-        hosts=(("apt.postgresql.org", "apt-archive.postgresql.org"),),
+        replace=(("apt.postgresql.org", "apt-archive.postgresql.org"),),
         apt_hosts=(
             ("apt.postgresql.org", "apt-archive.postgresql.org"),
             ("http://security.debian.org/debian-security", SECURITY_ARCHIVE),
@@ -2051,6 +2326,14 @@ BUILD_FIXES: dict[str, BuildFix] = {
         ),
         apt_ca_certificates=True,
         apt_update_before=("apt install",),
+    ),
+    # the `Dockerfile` of the bounty installs two packages under their bookworm
+    # names, and its unpinned base image now resolves to trixie
+    "open-webui": BuildFix(
+        replace=(
+            ("libgl1-mesa-glx", "libgl1"),
+            ("libglib2.0-0", "libglib2.0-0t64"),
+        )
     ),
 }
 
@@ -2109,7 +2392,7 @@ def pin_build_mirrors(
             # the code under test keeps its own build files
             continue
         text = dockerfile.read_text()
-        for host, replacement in fix.hosts if fix is not None else ():
+        for host, replacement in fix.replace if fix is not None else ():
             text = text.replace(host, replacement)
         apt_rewrite = _apt_host_rewrite(fix.apt_hosts if fix is not None else ())
         trailing_pins: list[str] = []
@@ -2411,17 +2694,21 @@ async def codebase_listing(sbx: SandboxEnvironment) -> str:
     return f"$ {command}\n{structure}"
 
 
-async def sandbox_git_diff(sbx: SandboxEnvironment) -> str:
-    """Diff of the agent's changes to its codebase copy (upstream `git_diff`)."""
+async def sandbox_git_diff(sbx: SandboxEnvironment, base: str) -> str:
+    """Diff of the agent's changes against `base` (upstream `git_diff`).
+
+    Measured against the commit the sandbox started at rather than `HEAD`: agents
+    commit their work, and `HEAD` would report their changes as no change at all.
+    """
     await sh(sbx, "git add -A", cwd=SANDBOX_CODEBASE_DIR)
-    numstat = await sh(sbx, "git diff --cached --numstat", cwd=SANDBOX_CODEBASE_DIR)
+    numstat = await sh(sbx, f"git diff --cached {base} --numstat", cwd=SANDBOX_CODEBASE_DIR)
     binary = {
         parts[2]
         for line in numstat.stdout.splitlines()
         if (parts := line.split("\t")) and len(parts) == NUMSTAT_FIELDS and parts[0] == "-"
     }
     pathspecs = " ".join(f":(exclude){path}" for path in sorted(binary))
-    diff = await sh(sbx, f"git diff --cached -- {pathspecs}", cwd=SANDBOX_CODEBASE_DIR)
+    diff = await sh(sbx, f"git diff --cached {base} -- {pathspecs}", cwd=SANDBOX_CODEBASE_DIR)
     return diff.stdout
 
 

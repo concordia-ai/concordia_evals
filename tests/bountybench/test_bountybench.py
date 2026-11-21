@@ -7,6 +7,7 @@ import os
 import subprocess
 import tarfile
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -677,6 +678,192 @@ def test_service_reference_exploit_runs_in_the_grading_container(
     ]
 
 
+class _FakeFileSandbox:
+    """Sandbox whose `read_file`/`write_file` hit an in-memory mapping."""
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+
+    async def read_file(self, path: str) -> str:
+        return self.files[path]
+
+    async def write_file(self, path: str, content: str) -> None:
+        self.files[path] = content
+
+
+def test_harness_fixes_survive_the_invariant_test_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restoring the test paths from the vulnerable commit reverts them."""
+    spec = _local_spec(tmp_path)
+    monkeypatch.setitem(
+        scorer.HARNESS_FIXES,
+        "demoapp",
+        (("tests/runtests.pl", 'if(!$cmdtype eq "perl")', 'if($cmdtype ne "perl")'),),
+    )
+    target = f"{SANDBOX_CODEBASE_DIR}/tests/runtests.pl"
+    sandbox = _FakeFileSandbox({target: 'if(!$cmdtype eq "perl") { }'})
+
+    asyncio.run(scorer._reapply_harness_fixes(sandbox, spec, Workspace(spec, tmp_path)))
+
+    assert sandbox.files[target] == 'if($cmdtype ne "perl") { }'
+
+
+def test_invariant_scores_are_read_from_the_app_dir_of_a_symlinked_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A script writing next to the checkout's parent lands in the app dir."""
+    spec = _local_spec(tmp_path)
+    seen: list[str] = []
+
+    async def fake_sh(
+        sbx: Any, command: str, cwd: str | None = None, timeout: int | None = None
+    ) -> ExecResult[str]:
+        seen.append(command)
+        stdout = ""
+        if command.startswith("cat /app/invariant_scores.json"):
+            stdout = '{"invariant_scores": {"unit_tests": 12}}'
+        return ExecResult(success=True, returncode=0, stdout=stdout, stderr="")
+
+    async def fake_run_script(
+        sbx: Any, directory: str, script: str, timeout: int | None = None
+    ) -> ExecResult[str]:
+        return ExecResult(success=True, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(scorer, "sh", fake_sh)
+    monkeypatch.setattr(scorer, "run_script_in_sandbox", fake_run_script)
+
+    scores, _ = asyncio.run(
+        scorer._run_invariant_script(None, spec, None, Path("/app/bt"), "run_repo_invariants.sh")
+    )
+
+    assert scores == {"unit_tests": 12}
+    assert seen[0].startswith("cat /app/bt/invariant_scores.json")
+    assert seen[1].startswith("rm -f /app/bt/invariant_scores.json")
+
+
+def test_a_sample_image_built_by_another_account_is_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The docker daemon is shared, so the recipe label decides, not a stamp."""
+    monkeypatch.setattr(environment, "image_exists", lambda tag: True)
+    monkeypatch.setattr(
+        environment, "image_recipe", lambda image: environment.recipe_digest("FROM a\n")
+    )
+    # the stamp of this account is missing: the image comes from another account
+    assert environment.built_from("image:latest", "FROM a\n", Path("/nonexistent/stamp"))
+
+    monkeypatch.setattr(
+        environment, "image_recipe", lambda image: environment.recipe_digest("FROM b\n")
+    )
+    assert not environment.built_from("image:latest", "FROM a\n")
+
+
+def test_a_stamped_image_is_reused_before_the_label_existed(tmp_path: Path) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(environment, "image_exists", lambda tag: True)
+    monkeypatch.setattr(environment, "image_recipe", lambda image: None)
+    stamp = tmp_path / "build.stamp"
+    stamp.write_text("FROM a\n")
+
+    assert environment.built_from("image:latest", "FROM a\n", stamp)
+    assert not environment.built_from("image:latest", "FROM b\n", stamp)
+    monkeypatch.undo()
+
+
+def test_the_patch_diff_is_taken_against_the_vulnerable_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent that commits would otherwise look like it changed nothing."""
+    commands: list[str] = []
+
+    async def fake_sh(
+        sbx: Any, command: str, cwd: str | None = None, timeout: int | None = None
+    ) -> ExecResult[str]:
+        commands.append(command)
+        stdout = "3\t1\tapp/main.py\n" if "--numstat" in command else "diff body"
+        return ExecResult(success=True, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(environment, "sh", fake_sh)
+
+    assert asyncio.run(environment.sandbox_git_diff(None, "abc123")) == "diff body"
+    assert commands[0] == "git add -A"
+    assert all("abc123" in command for command in commands[1:])
+
+
+def _patch_spec(tmp_path: Path) -> BountySpec:
+    """A local sample whose invariants the fake suites can pass or fail."""
+    spec = _local_spec(tmp_path)
+    repo_metadata = dict(spec.repo_metadata)
+    repo_metadata["invariant_thresholds"] = {"unit_tests": 12}
+    return replace(spec, repo_metadata=repo_metadata)
+
+
+def test_patch_grading_refuses_an_environment_that_fails_the_invariants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken environment must fail the sample, not every patch of it."""
+    spec = _patch_spec(tmp_path)
+    monkeypatch.setattr(scorer, "BASELINE_CACHE_DIR", tmp_path / "baselines")
+    monkeypatch.setattr(scorer, "image_id", lambda tag: "sha256:image")
+    runs: list[str] = []
+
+    async def fake_invariants(
+        sbx: Any, spec: BountySpec, workspace: Any, attempts: int = 1
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        runs.append("baseline")
+        return {"unit_tests": 4}, {}, "4 passed"
+
+    async def fake_reset(sbx: Any, spec: BountySpec, workspace: Any, commit: str) -> None:
+        return None
+
+    applied: list[str] = []
+
+    async def fake_apply(sbx: Any, diff: str) -> None:
+        applied.append(diff)
+
+    monkeypatch.setattr(scorer, "_run_invariants", fake_invariants)
+    monkeypatch.setattr(scorer, "_reset_state", fake_reset)
+    monkeypatch.setattr(scorer, "_apply_agent_diff", fake_apply)
+    monkeypatch.setattr(scorer, "_reapply_harness_fixes", lambda *args: asyncio.sleep(0))
+    workspace = Workspace(spec, tmp_path)
+
+    with pytest.raises(RuntimeError, match="do not pass on the unpatched code"):
+        asyncio.run(scorer._require_invariant_baseline(None, spec, workspace, "diff"))
+
+    assert runs == ["baseline"]
+    # the changes of the agent are back, whatever the baseline says
+    assert applied == ["diff"]
+    # the failing result is cached: the next run does not pay for it again
+    assert json.loads((tmp_path / "baselines" / f"{spec.sample_id}.json").read_text())[
+        "repo_scores"
+    ] == {"unit_tests": 4}
+
+
+def test_a_cached_baseline_keeps_the_passing_patch_gradable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extra run happens once per image, not once per sample run."""
+    spec = _patch_spec(tmp_path)
+    monkeypatch.setattr(scorer, "BASELINE_CACHE_DIR", tmp_path / "baselines")
+    monkeypatch.setattr(scorer, "image_id", lambda tag: "sha256:image")
+
+    async def fake_invariants(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the cached baseline must be reused")
+
+    monkeypatch.setattr(scorer, "_run_invariants", fake_invariants)
+    workspace = Workspace(spec, tmp_path)
+    cache = tmp_path / "baselines"
+    cache.mkdir()
+    (cache / f"{spec.sample_id}.json").write_text(
+        json.dumps(
+            {"image": "sha256:image", "repo_scores": {"unit_tests": 12}, "bounty_scores": {}}
+        )
+    )
+
+    asyncio.run(scorer._require_invariant_baseline(None, spec, workspace, "diff"))
+
+
 def test_sample_recipe_installs_the_service_checkout_at_build_time(
     tmp_path: Path,
 ) -> None:
@@ -1054,7 +1241,7 @@ def test_node_suites_install_their_dependencies_while_the_image_is_built(
 
     assert "npm config set registry https://registry.npmmirror.com" in recipe
     assert "cd /app/codebase && " in recipe
-    assert "ENV npm_config_offline=true" in recipe
+    assert 'ENV npm_config_offline="true"' in recipe
 
 
 def test_service_node_suite_primes_the_npm_cache_from_the_mounted_checkout(
@@ -1076,7 +1263,7 @@ def test_llama_index_caches_the_tiktoken_table_it_would_download(tmp_path: Path)
     recipe = sample_recipe(_spec(root), None, None)
 
     assert "tiktoken.get_encoding('cl100k_base')" in recipe
-    assert f"ENV TIKTOKEN_CACHE_DIR={environment.TIKTOKEN_CACHE_DIR}" in recipe
+    assert f'ENV TIKTOKEN_CACHE_DIR="{environment.TIKTOKEN_CACHE_DIR}"' in recipe
 
 
 def test_gradio_gets_pip_tools_in_its_wheelhouse() -> None:
@@ -1360,7 +1547,7 @@ def test_pin_build_mirrors_adds_the_pins_of_a_sample_that_no_longer_builds(
 
     pin_build_mirrors(
         root,
-        fix=BuildFix(constraints=("setuptools<81",), hosts=(("old.test", "new.test"),)),
+        fix=BuildFix(constraints=("setuptools<81",), replace=(("old.test", "new.test"),)),
     )
 
     text = (root / "Dockerfile").read_text()
@@ -1378,7 +1565,7 @@ def test_pin_build_mirrors_only_rewrites_the_host_of_a_sample(tmp_path: Path) ->
         'RUN echo "deb http://old.test/repo main" > /etc/apt/sources.list.d/x.list\n'
     )
 
-    pin_build_mirrors(root, fix=BuildFix(hosts=(("old.test", "new.test"),)))
+    pin_build_mirrors(root, fix=BuildFix(replace=(("old.test", "new.test"),)))
 
     text = (root / "initdb" / "Dockerfile").read_text()
     assert "deb http://new.test/repo main" in text
