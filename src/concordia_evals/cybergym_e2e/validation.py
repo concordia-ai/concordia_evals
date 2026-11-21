@@ -143,13 +143,13 @@ def _setup_validation_container(
         "apt-get update -qq && apt-get install -y -qq sudo git >/dev/null 2>&1",
         timeout=900,
     )
-    last_err: RuntimeError | None = None
+    last_err: Exception | None = None
     for attempt in range(INSTALL_VALIDATE_DEPS_ATTEMPTS):
         try:
             _exec(container_id, INSTALL_VALIDATE_DEPS, timeout=1200)
             last_err = None
             break
-        except RuntimeError as e:
+        except Exception as e:
             last_err = e
             logger.warning(
                 "install validate deps attempt %d/%d failed in %s: %s",

@@ -47,7 +47,7 @@ from concordia_evals.cybergym_e2e.dataset import (
     write_compose_file,
 )
 from concordia_evals.cybergym_e2e.prompts import get_prompt
-from concordia_evals.cybergym_e2e.scorer import cybergym_e2e_scorer
+from concordia_evals.cybergym_e2e.scorer import cybergym_e2e_scorer, cybergym_e2e_scorer_both
 from concordia_evals.cybergym_e2e.setup_solver import setup_workspace
 
 logger = logging.getLogger(__name__)
@@ -189,11 +189,15 @@ def build_samples(
         # (pull policy "missing"), so we never pre-pull here.
 
         slug = task_path.replace("/", "_")
-        compose_file = write_compose_file(
-            slug, build_image, task_data_dir, script_dir, compose_dir, setup_proxy
-        )
 
         for sample_mode in sample_modes(mode):
+            # mode="both" pairs run concurrently and network_lockdown locates
+            # containers by compose-file label: each sample needs its own
+            # compose file or lockdown would disconnect both containers.
+            compose_slug = f"{slug}-{sample_mode}" if mode == "both" else slug
+            compose_file = write_compose_file(
+                compose_slug, build_image, task_data_dir, script_dir, compose_dir, setup_proxy
+            )
             samples.append(
                 Sample(
                     input=get_prompt(sample_mode, repo_to_patch, prompt_style),  # type: ignore[arg-type]
@@ -320,5 +324,5 @@ def cybergym_e2e(
             )
         ),
         solver=solver,
-        scorer=cybergym_e2e_scorer(include_composite=(mode == "both")),
+        scorer=cybergym_e2e_scorer_both() if mode == "both" else cybergym_e2e_scorer(),
     )

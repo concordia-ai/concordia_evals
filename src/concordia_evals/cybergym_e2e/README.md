@@ -90,8 +90,16 @@ comparisons).
 
 Run `mode="both"` to get the composite natively in the eval log: each task
 runs in both modes as paired samples, and the "success" metrics include
-`composite_weighted`, computed by a custom metric from per-sample mode
-metadata — no post-processing needed for the pipeline.
+per-mode breakdowns (`e2e_accuracy`, `patch_only_accuracy`) and
+`composite_weighted`, computed by custom metrics from per-sample metadata —
+no post-processing needed for the pipeline. The composite only counts tasks
+with BOTH modes present (partial pairs are excluded) and skips samples
+flagged `infra_error`.
+
+Samples whose validation hits an infrastructure error (a stage status of
+`error`, e.g. a proxy outage) are flagged `infra_error=1` in the score and
+excluded from all capability metrics and the composite, so infra flaps are
+not reported as model capability failures.
 
 ```bash
 uv run inspect eval src/concordia_evals/cybergym_e2e/cybergym_e2e.py@cybergym_e2e \

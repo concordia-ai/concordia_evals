@@ -27,6 +27,12 @@ INSTALL_VALIDATE_DEPS = """
 set -e
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
+
+# Idempotency for the caller-side retry: wipe partial state from a previous
+# attempt before starting (uv venv refuses an existing directory).
+rm -rf /scripts/.venv
+rm -f "$HOME/.local/bin/uv" "$HOME/.local/bin/uvx"
+
 apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1
 
 direct() { env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy "$@"; }
@@ -49,7 +55,7 @@ run_uv venv /scripts/.venv --python 3.13 >/dev/null 2>&1
 run_uv pip install --python /scripts/.venv/bin/python tomli >/dev/null 2>&1
 """
 
-# Number of attempts for the (now idempotent) validate-deps install step.
+# Number of attempts for the (idempotent, see cleanup above) install step.
 INSTALL_VALIDATE_DEPS_ATTEMPTS = 2
 
 # Mirrors the arvo/cybergym image cleanup in upstream setup_workspace().
@@ -110,13 +116,13 @@ def setup_workspace() -> Solver:
             "install sudo/git",
             timeout=900,
         )
-        last_err: RuntimeError | None = None
+        last_err: Exception | None = None
         for attempt in range(INSTALL_VALIDATE_DEPS_ATTEMPTS):
             try:
                 await _exec(INSTALL_VALIDATE_DEPS, "install validate deps", timeout=1200)
                 last_err = None
                 break
-            except RuntimeError as e:
+            except Exception as e:
                 last_err = e
                 logger.warning(
                     "install validate deps attempt %d/%d failed: %s",

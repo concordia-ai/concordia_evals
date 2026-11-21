@@ -219,3 +219,27 @@
   （composite_weighted 只在 mode="both" 时注册）。report.py 仍保留作
   历史两趟日志的离线合成工具。注意：both 模式每任务跑两遍，成本≈e2e +
   patch-only（后者有 crash.log 喂线索，token 远少于 e2e 发现阶段）。
+
+### 2026-11-21
+
+- [x] **验收 review（Bi, #migrate-cybergym-e2e:#2）修复轮**：
+  1. scorer 注册时机：工厂重组导致模块 import 不注册 scorer，且包内
+     scorer 被注册为 `concordia_evals/` 限定名而日志记裸名，`inspect score`
+     新进程解析失败 → 改为模块级两个注册变体（`cybergym_e2e_scorer` /
+     `cybergym_e2e_scorer_both`），并在 import 时补裸名 alias（registry_add）。
+  2. mode="both" 配对样本共用 compose 文件 → lockdown 按 compose 标签定位
+     会把两个并发样本的容器一起断网 → 每样本独立 compose slug
+     （`<task>-<mode>`）。
+  3. 安装重试幂等：`uv venv` 对已存在 venv 非幂等 → 脚本开头清理
+     /scripts/.venv 与 uv 二进制；重试 except 放宽到 Exception（覆盖
+     TimeoutExpired/SandboxTimeoutError）。
+  4. **infra error 不再计入能力分**：score value 新增 `infra_error` 字段
+     （任一次 stage status=error），capability_accuracy/composite 全部过滤；
+     composite 按 task_path 配对（残缺配对剔除并 warn）；both 变体新增
+     原生分项 e2e_accuracy / patch_only_accuracy；/output 读取异常区分
+     "文件不存在"（缺交付）与基建故障（抛错样本）。
+  5. crash.log gated-403 的日志从 debug 升 warning（patch-only 缺输入
+     不再静默）。
+  6. 新增单测至 47 个（裸名解析、infra 过滤、配对剔除、分项指标、
+     注册变体）。单模式历史日志的 success accuracy 口径由 accuracy 变为
+     capability_accuracy（对无 infra error 的历史结果数值不变）。

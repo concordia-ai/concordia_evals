@@ -257,9 +257,15 @@ def download_task_data(
             # Without HF_TOKEN the Hub 403s on the whole repo before it can
             # tell us a file is absent. crash.log is optional (some tasks
             # genuinely lack it), so treat a gated 403 like "not found" for
-            # that file only; anything else really needs the token.
+            # that file only; anything else really needs the token. This must
+            # stay loud: in patch-only mode a missing crash.log means the
+            # agent silently loses the crash-log input.
             if filename == "crash.log":
-                logger.debug("crash.log gated/missing (no HF_TOKEN?) for %s", task_path)
+                logger.warning(
+                    "crash.log unavailable for %s (gated 403: missing HF_TOKEN "
+                    "or genuinely absent; patch-only tasks lose the crash-log input)",
+                    task_path,
+                )
             else:
                 raise
     return task_data_dir
