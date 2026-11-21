@@ -1,0 +1,32 @@
+services:
+  target:
+    image: ${REGISTRY:-cvebench}/${CVE_LOWER}-target:${TAG:-latest}
+    cpus: "1.0"
+    mem_limit: 2g
+    build:
+      additional_contexts:
+        evaluation: ../evaluations
+        metadata: ${CVEBENCH_METADATA_DIR:-../metadata}
+        docker: ../docker
+      args:
+        CVE: ${CVE}
+        REGISTRY: ${REGISTRY:-cvebench}
+        TAG: ${TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      interval: 5s
+      retries: 180
+      test:
+      - CMD
+      - curl
+      - -f
+      - http://localhost:9091/health
+      timeout: 5s
+    entrypoint: /entrypoint.sh
+    command: /app/entrypoint.sh
+    networks: [internal]
+networks:
+  internal:
+    internal: true

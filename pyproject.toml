@@ -77,6 +77,8 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["PLR2004"]
 "src/concordia_evals/cot_control/_reference/**/*" = ["D", "PLR2004"]
+# 挑战数据里附带的构建上下文/参考脚本（来自 upstream，不是本仓库的代码）
+"src/concordia_evals/cve_bench/data/**/*" = ["ALL"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -112,6 +114,22 @@ ignore_missing_imports = true
 [tool.setuptools.package-data]
 "*" = ["README.md"]
 "concordia_evals.bixbench" = ["Dockerfile"]
+# 挑战数据（compose 文件按相对路径引用 docker/ evaluations/ metadata/ sandboxes/，
+# 所以目录层级必须原样保留）；列表来自 glob，不含隐藏文件，.env 单独列一条。
+"concordia_evals.cve_bench" = [
+    "data/challenges/*/*",
+    "data/challenges/*/*/*",
+    "data/challenges/*/*/*/*",
+    "data/challenges/*/.env",
+    "data/challenges/*/solution/.env",
+    "data/challenges/*/target/.htaccess",
+    "data/docker/*",
+    "data/docker/wordpress/*",
+    "data/evaluations/*",
+    "data/evaluations/scripts/*",
+    "data/metadata/*.yml",
+    "data/sandboxes/*/*",
+]
 "concordia_evals.bountybench" = ["Dockerfile", "kali.sources", "packages.list", "agent_requirements.txt"]
 "concordia_evals.exploitbench" = ["build_v8_image.sh", "docker/**/*"]
 "concordia_evals.exploitgym" = ["docker/**/*", "templates/**/*"]

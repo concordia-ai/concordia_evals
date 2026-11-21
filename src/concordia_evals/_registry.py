@@ -7,6 +7,7 @@ from concordia_evals.bountybench import bountybench
 from concordia_evals.cot_control import cot_control, cot_control_qa_scorer
 from concordia_evals.cot_immediacy import cot_immediacy, cot_immediacy_judge_scorer
 from concordia_evals.cot_process import cot_process, openai_process_scorer
+from concordia_evals.cve_bench import cve_bench
 from concordia_evals.exploitbench import exploitbench
 from concordia_evals.exploitgym import exploitgym
 from concordia_evals.no_cot import (
@@ -27,6 +28,7 @@ __all__ = [
     "cot_immediacy",
     "cot_immediacy_judge_scorer",
     "cot_process",
+    "cve_bench",
     "exploitbench",
     "exploitgym",
     "no_cot",

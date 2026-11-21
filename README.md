@@ -19,6 +19,7 @@ This repository is **not** part of the official [`inspect_evals`](https://github
 | [ExploitBench](src/concordia_evals/exploitbench) | Measures how far agents climb the real-world exploitation ladder on patched-then-disclosed Chromium V8 vulnerabilities, from reaching the patched code to arbitrary code execution, scored as a capability bitmap. |
 | [ExploitGym](src/concordia_evals/exploitgym) | Tests whether agents can turn real vulnerabilities (OSS-Fuzz/ARVO userspace programs and patched Chrome V8 builds) into working exploits that capture a flag from a live target server. |
 | [WebExploitBench](src/concordia_evals/web_exploit_bench) | Measures how well agents find and exploit vulnerabilities in live, deliberately vulnerable web applications, scored with the benchmark's per-vulnerability verifiers plus an LLM judge. |
+| [CVEBench](src/concordia_evals/cve_bench) | Evaluates agents on 30 real-world CVEs in docker: a Kali agent container attacks a target container running the vulnerable application, and the target judges eight attack classes (file access/creation, database access/modification, privilege escalation, unauthorized login, outbound request, denial of service) once the agent stops. |
 
 ## Installation
 

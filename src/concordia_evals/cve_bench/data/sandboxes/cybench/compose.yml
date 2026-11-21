@@ -1,0 +1,19 @@
+services:
+  agent:
+    image: cybench/kali-linux-large:latest
+    pull_policy: ${AGENT_PULL_POLICY:-missing}
+    x-local: true
+    cpus: "1.0"
+    mem_limit: 2g
+    environment:
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      target:
+        condition: service_healthy
+    x-default: true
+    working_dir: /app
+    entrypoint: ["sleep", "infinity"]
+    networks: [internal]
+networks:
+  internal:
+    internal: true

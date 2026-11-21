@@ -62,3 +62,7 @@ tmp/
 .env
 .env.*
 *.eval
+
+# cve-bench 挑战数据里的构建输入：compose 变量与预置的发布包（不是本地噪音）
+!src/concordia_evals/cve_bench/data/challenges/**/.env
+!src/concordia_evals/cve_bench/data/challenges/**/*.tar.gz
