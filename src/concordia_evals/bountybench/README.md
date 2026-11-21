@@ -58,7 +58,7 @@ See `uv run inspect eval --help` for all available options.
 - `use_cwe` (bool): Include the bounty CWE in the prompt (upstream `--use_cwe`). (default: `False`)
 - `command_timeout` (int): Timeout in seconds for every command the agent runs (upstream `TIMEOUT_PER_COMMAND`). (default: `120`)
 - `disable_submit` (bool): Do not give the agent a `submit` tool (upstream `--disable_submit`). (default: `False`)
-- `agent` (Solver | None): Optional solver run in place of the built in `react` agent. (default: `None`)
+- `agent` (Solver | None): Optional solver run in place of the built in `react` agent (a harness). Such a run never requires a submission: the agent ends its own loop instead of calling a tool, so its workspace is graded as it stands. (default: `None`)
 
 ## Requirements
 
@@ -76,7 +76,7 @@ A sample is one (system, bounty) pair. The agent works in a Kali Linux container
 /app/verify_files     # the bounty's public verify scripts
 ```
 
-The agent is Inspect's `react` agent with a `bash` tool and a `submit` tool: calling `submit` ends the sample immediately and hands the work to grading, so a finished agent never runs down `max_messages`. Work that is not submitted is not graded (upstream's `no_submission` outcome); pass `disable_submit=True` to grade whatever the agent left behind.
+The agent is Inspect's `react` agent with a `bash` tool and a `submit` tool: calling `submit` ends the sample immediately and hands the work to grading, so a finished agent never runs down `max_messages`. Work that is not submitted is not graded (upstream's `no_submission` outcome); pass `disable_submit=True` to grade whatever the agent left behind. A run with a custom `agent` (a harness) is graded the same way as `disable_submit=True` — a harness has no `submit` tool and stops on its own — and its prompt gets a closing note that there is nothing to submit and that the workspace is graded as it stands.
 
 For systems that run as services (`target_host` in the task metadata), the task's own `docker-compose.yml` stack is started from the sample's own setup script and the agent container joins the upstream `shared_net` docker network, so `target_host` hostnames (such as `lunary-app:3333`) resolve exactly as they do upstream.
 
@@ -157,12 +157,12 @@ The prompts, the grading logic and the per-task settings follow the upstream rep
 | --- | --- |
 | `--phase_iterations 100` (one command per iteration, a single root phase in the `detect`, `exploit` and `patch` workflows) | `max_messages=150` per sample (a react turn is one assistant message plus one tool result per command, about two commands per turn) |
 | `--use_cwe` | `use_cwe=True` (adds the bounty CWE to the prompt) |
-| `--disable_submit` | `disable_submit=True` (no `submit` tool, submission not required) |
+| `--disable_submit` | `disable_submit=True` (no `submit` tool, submission not required); a `-T agent=...` harness run also grades without a submission |
 | `TIMEOUT_PER_COMMAND = 120` | `command_timeout=120` (the agent's `bash` timeout) |
 | `PIP_INSTALL_TIMEOUT = 1200`, `INVARIANTS_TIMEOUT = 5400`, `INVARIANTS_RETRY = 3` | same values |
 | `max_input_tokens=8192`, `max_output_tokens=4096` | not preset: Inspect passes these through to the model |
 
-Also mirrored: prompt selection (including `bounty_setup_hosts` for the patch prompt), the `tree` listing embedded in the prompt, the `exploit_files`/`verify_files` layout, hidden verify files being withheld from the agent until verification, the editable install before the agent starts (and its artefacts being excluded from the agent's diff), `detect` running with repository setup only, the invariant suites running before the reference exploit in `patch`, `restore_invariant_test_paths`, `git clean` of the workspace between runs, the strict container health check of the setup resources, and grading only submitted work.
+Also mirrored: prompt selection (including `bounty_setup_hosts` for the patch prompt), the `tree` listing embedded in the prompt, the `exploit_files`/`verify_files` layout, hidden verify files being withheld from the agent until verification, the editable install before the agent starts (and its artefacts being excluded from the agent's diff), `detect` running with repository setup only, the invariant suites running before the reference exploit in `patch`, `restore_invariant_test_paths`, `git clean` of the workspace between runs, the strict container health check of the setup resources, and grading only submitted work (except for `disable_submit=True` and harness runs, which have no `submit` tool).
 
 Deliberate differences:
 

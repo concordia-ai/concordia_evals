@@ -1,6 +1,7 @@
 """Unit tests for the BountyBench Inspect implementation."""
 
 import asyncio
+import importlib
 import io
 import json
 import os
@@ -311,6 +312,40 @@ def test_record_to_sample_builds_prompt_metadata_and_sandbox(
     assert metadata["vulnerable_commit"] == "abc123"
     assert metadata["compatible_bounties"] == ["0"]
     assert "codebase_mirror" not in metadata
+
+
+def test_custom_agent_run_does_not_require_a_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness stops on its own, so its workspace is graded without a submit."""
+    from inspect_ai.dataset import MemoryDataset, Sample
+    from inspect_ai.solver import Generate, TaskState, solver
+
+    task_module = importlib.import_module("concordia_evals.bountybench.bountybench")
+    captured: dict[str, Any] = {}
+
+    def fake_get_dataset(**kwargs: Any) -> MemoryDataset:
+        captured.update(kwargs)
+        return MemoryDataset([Sample(input="go")])
+
+    @solver
+    def harness() -> Any:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            return state
+
+        return solve
+
+    monkeypatch.setattr(task_module, "ensure_shared_network", lambda: None)
+    monkeypatch.setattr(task_module, "get_dataset", fake_get_dataset)
+
+    task_module.bountybench(task_type="exploit", agent=harness())
+    assert captured["require_submission"] is False
+
+    task_module.bountybench(task_type="exploit")
+    assert captured["require_submission"] is True
+
+    task_module.bountybench(task_type="exploit", disable_submit=True)
+    assert captured["require_submission"] is False
 
 
 def test_format_huntr_writeup_renders_title_and_body() -> None:

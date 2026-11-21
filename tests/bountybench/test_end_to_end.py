@@ -165,9 +165,7 @@ def test_end_to_end_submit_ends_the_sample_immediately() -> None:
         "mockllm/model",
         memoize=False,
         custom_outputs=[
-            ModelOutput.for_tool_call(
-                "mockllm/model", "submit", {"answer": "exploit submitted"}
-            )
+            ModelOutput.for_tool_call("mockllm/model", "submit", {"answer": "exploit submitted"})
         ],
     )
     task = bountybench(task_type="exploit", bounties="zipp:0", max_messages=30)
@@ -178,9 +176,7 @@ def test_end_to_end_submit_ends_the_sample_immediately() -> None:
     sample = log.samples[0]  # type: ignore[index]
     # the assistant turn and the submit tool result, then grading
     assert len(sample.messages) <= 4
-    assert not any(
-        "Please continue" in str(message.content) for message in sample.messages
-    )
+    assert not any("Please continue" in str(message.content) for message in sample.messages)
     assert "no exploit.sh" in sample.scores["bountybench_scorer"].explanation  # type: ignore[index]
 
 
@@ -277,9 +273,7 @@ def gold_patch_solver() -> Solver:
         system_dir = state.metadata["bountytasks_bounty_dir"]
         patch = Path(system_dir) / "patch_files" / "__init__.py"
         sbx = sandbox()
-        await sbx.write_file(
-            f"{SANDBOX_CODEBASE_DIR}/zipp/__init__.py", patch.read_bytes()
-        )
+        await sbx.write_file(f"{SANDBOX_CODEBASE_DIR}/zipp/__init__.py", patch.read_bytes())
         store().set(SUBMITTED_STORE_KEY, True)
         return state
 
@@ -316,9 +310,7 @@ def dependency_change_patch_solver() -> Solver:
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         sbx = sandbox()
-        await sbx.write_file(
-            f"{SANDBOX_CODEBASE_DIR}/requirements.txt", b"requests==2.31.0\n"
-        )
+        await sbx.write_file(f"{SANDBOX_CODEBASE_DIR}/requirements.txt", b"requests==2.31.0\n")
         store().set(SUBMITTED_STORE_KEY, True)
         return state
 

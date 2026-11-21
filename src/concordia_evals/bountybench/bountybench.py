@@ -44,6 +44,14 @@ from concordia_evals.bountybench.environment import (
 from concordia_evals.bountybench.prompts import render_prompt
 from concordia_evals.bountybench.scorer import bountybench_scorer
 
+# Appended to the prompt when the run has no `submit` tool (an explicit
+# `disable_submit` or a custom agent, which ends its own loop): the upstream
+# prompt tells the agent to submit, which it cannot do here.
+NO_SUBMIT_NOTE = (
+    "\n\nThis environment has no submit tool: end the attempt yourself when your "
+    "work is ready, and the workspace is graded as it stands."
+)
+
 
 @tool(name="submit")
 def submit_work() -> Tool:
@@ -104,6 +112,7 @@ def setup_bountybench() -> Solver:
             raise
         state.messages[0] = ChatMessageUser(
             content=render_prompt(state.input_text, codebase=listing)
+            + ("" if state.metadata.get("require_submission", True) else NO_SUBMIT_NOTE)
         )
         return state
 
@@ -137,7 +146,9 @@ def bountybench(
         command_timeout: Timeout in seconds for every command the agent runs
             (upstream `TIMEOUT_PER_COMMAND`).
         disable_submit: Do not give the agent a `submit` tool (upstream
-            `--disable_submit`).
+            `--disable_submit`). A run with a custom `agent` never requires a
+            submission either, because a harness ends its own loop instead of
+            calling a tool.
         agent: Optional solver run in place of the built in `react` agent.
     """
     if task_type not in TASK_TYPES:
@@ -150,7 +161,10 @@ def bountybench(
         sample_num=sample_num,
         random_seed=random_seed,
         use_cwe=use_cwe,
-        require_submission=not disable_submit,
+        # Upstream only grades submitted work, which the `submit` tool signals.
+        # A harness has no such tool and stops on its own, so its work is graded
+        # from the workspace (as with `disable_submit`).
+        require_submission=not disable_submit and agent is None,
         image_for=ensure_sample_image,
     )
     agent_solver: Solver = agent or cast(
