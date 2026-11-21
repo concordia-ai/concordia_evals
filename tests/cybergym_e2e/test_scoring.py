@@ -137,3 +137,20 @@ class TestClassifyValidateError:
     def test_unrecognized_defaults_to_environment(self):
         assert classify_validate_error(2, "something unexpected") == "validate-env"
         assert classify_validate_error(2, None) == "validate-env"
+
+    def test_compile_with_network_fault_is_environment(self):
+        # Bi's counterexample: ffmpeg's `make fate-rsync` fetches samples over
+        # the network inside compile.sh; a fetch failure is not agent-caused
+        out = (
+            "Compile failed:\nSTDOUT:\nmake all\nSTDERR:\n"
+            "rsync: failed to connect to fate-suite.ffmpeg.org: Connection timed out"
+        )
+        assert classify_validate_error(3, out) == "validate-env"
+
+    def test_compile_with_real_build_error_is_agent(self):
+        out = (
+            "Compile failed:\nSTDOUT:\nSTDERR:\n"
+            "error: expected ';' before 'return' in patched_function"
+        )
+        for stage in (2, 3, 4):
+            assert classify_validate_error(stage, out) == "validate-agent"

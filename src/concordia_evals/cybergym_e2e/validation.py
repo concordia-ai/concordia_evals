@@ -231,6 +231,32 @@ def _setup_validation_container(
     _exec(container_id, "cp /task_data/poc.bin /data/poc.bin 2>/dev/null || true")
 
 
+# Network/fetch fault signatures inside an error output. compile.sh and
+# prepare.sh themselves fetch dependencies (e.g. ffmpeg's `make fate-rsync`),
+# so a "Compile failed" block is only agent-caused when the output does not
+# carry one of these (see DEVLOG: fate-rsync hang, zstd seed download,
+# git clone failures).
+_NETWORK_FAULT_SIGNATURES = (
+    "rsync",
+    "fate-suite",
+    "wget:",
+    "curl:",
+    "Could not resolve host",
+    "Temporary failure in name resolution",
+    "Connection timed out",
+    "Connection refused",
+    "Network is unreachable",
+    "Failed to fetch",
+    "unable to connect",
+    "Proxy request failed",
+    "502 Bad Gateway",
+)
+
+
+def _looks_like_network_fault(text: str) -> bool:
+    return any(sig in text for sig in _NETWORK_FAULT_SIGNATURES)
+
+
 def classify_validate_error(stage: int, output: str | None) -> str:
     """Classify a validate.py stage=error as agent-caused or environment.
 
@@ -238,8 +264,10 @@ def classify_validate_error(stage: int, output: str | None) -> str:
     vendored file stays byte-identical):
 
     - "Failed to apply patch with strip levels 0-3" -> agent (malformed patch)
-    - "Compile failed" in patched stages (2-4) -> agent (patch broke the
-      build); at stage 1 (unpatched source) -> environment
+    - "Compile failed" -> agent when the compiler output shows a real build
+      breakage in patched stages (2-4); environment at stage 1 (unpatched
+      source) and whenever the output carries network/fetch fault signatures
+      (compile.sh's own downloads can fail independently of the patch)
     - "Failed to run prepare.sh" (in-container network/fetch failures),
       "Command timed out", "No source backup" -> environment
     - anything unrecognized -> environment, with a warning: never count a
@@ -249,7 +277,9 @@ def classify_validate_error(stage: int, output: str | None) -> str:
     if "Failed to apply patch with strip levels" in out:
         return "validate-agent"
     if "Compile failed" in out:
-        return "validate-agent" if stage in (2, 3, 4) else "validate-env"
+        if stage == 1 or _looks_like_network_fault(out):
+            return "validate-env"
+        return "validate-agent"
     if "Failed to run prepare.sh" in out or "Command timed out" in out or "No source backup" in out:
         return "validate-env"
     logger.warning("Unclassified validate.py stage%d error output: %s", stage, out[-300:])
