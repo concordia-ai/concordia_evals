@@ -22,12 +22,12 @@ def _run_with_fake_stages(monkeypatch, mode: str, statuses: dict[int, str]):
     """Run run_full_validation with stage executions replaced by a fake."""
     executed: list[int] = []
 
-    def fake_stage(*, stage: int, **kwargs: Any) -> str:
+    def fake_stage(*, stage: int, **kwargs: Any) -> tuple[str, str]:
         executed.append(stage)
-        return statuses[stage]
+        return statuses[stage], "validate"
 
     monkeypatch.setattr(validation, "run_stage_validation", fake_stage)
-    results = validation.run_full_validation(mode=mode, **BASE_KWARGS)
+    results, _sources = validation.run_full_validation(mode=mode, **BASE_KWARGS)
     return results, executed
 
 
@@ -93,3 +93,18 @@ def test_sanitized_config_toml():
     assert "task_id" not in toml
     assert "build_image" not in toml
     assert _sanitized_config_toml("curl", []) == 'repo_to_patch = "curl"\n'
+
+
+def test_run_full_validation_reports_error_sources(monkeypatch):
+    """Orchestration errors must be distinguishable from validate.py errors."""
+
+    def fake_stage(*, stage: int, **kwargs: Any) -> tuple[str, str]:
+        return ("error", "orchestration") if stage == 1 else ("passed", "validate")
+
+    monkeypatch.setattr(validation, "run_stage_validation", fake_stage)
+    results, sources = validation.run_full_validation(mode="e2e", **BASE_KWARGS)
+    assert results["stage1"] == "error"
+    assert sources["stage1"] == "orchestration"
+    # downstream stages are skipped without executing (source "skipped")
+    assert sources["stage2"] == "skipped"
+    assert results["stage2"] == "skipped"

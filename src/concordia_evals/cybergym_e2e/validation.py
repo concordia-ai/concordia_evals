@@ -245,8 +245,15 @@ def run_stage_validation(
     patch_path: Path | None,
     compile_timeout: int | None = None,
     setup_proxy: str | None = None,
-) -> StageStatus:
-    """Run one validation stage in a fresh container; return its status."""
+) -> tuple[StageStatus, str]:
+    """Run one validation stage in a fresh container.
+
+    Returns (status, source): source is "validate" when the status comes from
+    the vendored validate.py JSON (including its "error" cases, which mix
+    agent-caused failures like compile errors with genuine faults), and
+    "orchestration" when our own container/setup/exec plumbing failed — the
+    only cases that count as infrastructure errors downstream.
+    """
     container_id: str | None = None
     try:
         container_id = _start_validation_container(
@@ -303,16 +310,17 @@ def run_stage_validation(
                 check=False,
             )
             if result.returncode != 0:
-                return "error"
+                return "error", "orchestration"
             with open(tmp_path) as f:
                 stage_results: dict[str, Any] = json.load(f)
             status = stage_results.get(f"stage{stage}")
-            return status if status in ("passed", "failed", "skipped") else "error"
+            value: StageStatus = status if status in ("passed", "failed", "skipped") else "error"
+            return value, "validate"
         finally:
             Path(tmp_path).unlink(missing_ok=True)
     except Exception:
         logger.exception("Stage %d validation error", stage)
-        return "error"
+        return "error", "orchestration"
     finally:
         if container_id:
             subprocess.run(
@@ -335,14 +343,20 @@ def run_full_validation(
     patch_path: Path | None,
     compile_timeout: int | None = None,
     setup_proxy: str | None = None,
-) -> dict[str, StageStatus | None]:
-    """Run all applicable stages with upstream's cumulative skip logic."""
+) -> tuple[dict[str, StageStatus | None], dict[str, str]]:
+    """Run all applicable stages with upstream's cumulative skip logic.
+
+    Returns (results, sources): sources maps each executed stage to
+    "validate" or "orchestration" (see run_stage_validation); skipped stages
+    get source "skipped".
+    """
     results: dict[str, StageStatus | None] = {
         "stage1": None,
         "stage2": None,
         "stage3": None,
         "stage4": None,
     }
+    sources: dict[str, str] = {}
     stages = [1, 2, 3, 4] if mode == "e2e" else [3, 4]
     # Upstream skip rules: S2 needs S1; S3 needs S2 (e2e only); S4 needs S3.
     depends_on: dict[int, str | None] = {
@@ -354,8 +368,9 @@ def run_full_validation(
         dependency = depends_on.get(stage)
         if dependency is not None and results.get(dependency) != "passed":
             results[f"stage{stage}"] = "skipped"
+            sources[f"stage{stage}"] = "skipped"
             continue
-        results[f"stage{stage}"] = run_stage_validation(
+        status, source = run_stage_validation(
             stage=stage,
             build_image=build_image,
             mode=mode,
@@ -369,4 +384,6 @@ def run_full_validation(
             compile_timeout=compile_timeout,
             setup_proxy=setup_proxy,
         )
-    return results
+        results[f"stage{stage}"] = status
+        sources[f"stage{stage}"] = source
+    return results, sources

@@ -243,3 +243,9 @@
   6. 新增单测至 47 个（裸名解析、infra 过滤、配对剔除、分项指标、
      注册变体）。单模式历史日志的 success accuracy 口径由 accuracy 变为
      capability_accuracy（对无 infra error 的历史结果数值不变）。
+  7. **infra_error 分类修正（Bi 复验第二轮）**：上游 validate.py 在 agent
+     patch 编译失败等 agent 原因下也写 stage=error，不能按 stage 字符串
+     一刀切。run_stage_validation 现在返回 (status, source)，source =
+     orchestration（我方容器/安装/exec 管道故障 → 计 infra_error）或
+     validate（vendored validate.py 的 JSON 状态，含 agent 真实失败 → 计
+     能力失败）。run_full_validation 返回 (results, sources)。

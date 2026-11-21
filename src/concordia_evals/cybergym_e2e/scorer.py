@@ -218,6 +218,7 @@ async def _score(state: TaskState, target: Target) -> Score:
         "stage3": None,
         "stage4": None,
     }
+    sources: dict[str, str] = {}
     if mode == "e2e" and poc_bytes is None:
         results.update(stage1="no_poc", stage2="skipped", stage3="skipped", stage4="skipped")
     elif patch_bytes is None:
@@ -237,7 +238,7 @@ async def _score(state: TaskState, target: Target) -> Score:
             patch_path = tmp_dir / "fix.patch"
             patch_path.write_bytes(patch_bytes)
 
-            validation_results = await asyncio.to_thread(
+            validation_results, sources = await asyncio.to_thread(
                 run_full_validation,
                 mode=mode,
                 build_image=state.metadata["build_image"],
@@ -265,7 +266,11 @@ async def _score(state: TaskState, target: Target) -> Score:
         success = int(bool(s3 and s4))
 
     statuses = {k: v or "n/a" for k, v in results.items()}
-    infra_error = int(any(v == "error" for v in results.values()))
+    # Only orchestration-level failures (container/setup/exec plumbing) count
+    # as infrastructure errors. validate.py's own "error" statuses include
+    # agent-caused failures (e.g. the agent's patch breaking compile.sh) and
+    # must remain capability failures.
+    infra_error = int(any(src == "orchestration" for src in sources.values()))
     return Score(
         value={
             "success": success,
