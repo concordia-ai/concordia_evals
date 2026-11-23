@@ -10,12 +10,14 @@ if TYPE_CHECKING:
     from concordia_evals.cot_control import cot_control
     from concordia_evals.cot_immediacy import cot_immediacy
     from concordia_evals.cot_process import cot_process
+    from concordia_evals.cybergym_e2e import cybergym_e2e
     from concordia_evals.no_cot import no_cot
 
 __version__ = "0.1.0"
 __all__ = [
     "bixbench",
     "cot_control",
+    "cybergym_e2e",
     "cot_immediacy",
     "cot_process",
     "no_cot",
@@ -24,6 +26,7 @@ __all__ = [
 _TASK_MODULES = {
     "bixbench": "concordia_evals.bixbench.bixbench",
     "cot_control": "concordia_evals.cot_control.cot_control",
+    "cybergym_e2e": "concordia_evals.cybergym_e2e.cybergym_e2e",
     "cot_immediacy": "concordia_evals.cot_immediacy.cot_immediacy",
     "cot_process": "concordia_evals.cot_process.cot_process",
     "no_cot": "concordia_evals.no_cot.no_cot",
