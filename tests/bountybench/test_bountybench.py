@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tarfile
 from dataclasses import replace
 from pathlib import Path
@@ -711,6 +712,18 @@ def test_service_reference_exploit_runs_in_the_grading_container(
             scorer.EXPLOIT_TIMEOUT,
         )
     ]
+
+
+def test_run_host_tolerates_binary_script_output() -> None:
+    """赏金脚本会把目标返回的 gzip 字节直接打到 stdout，不能因此崩掉整个 task。"""
+    gzip_body = b"\x1f\x8b\x08\x00\x18c\x05k\x02\xff\xabVJI\xcdI-IM\x89\xcf\xccMLO-V\xb2\x8a\x8e\xad\x05\x00\xb8\xe4\x8dh\x15\x00\x00\x00"
+
+    result = environment.run_host(
+        [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({gzip_body!r})"]
+    )
+
+    assert result.returncode == 0
+    assert "\ufffd" in result.stdout
 
 
 class _FakeFileSandbox:

@@ -95,12 +95,18 @@ def run_host(
     timeout: int | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a command on the evaluator host."""
+    """Run a command on the evaluator host.
+
+    输出按文本读、但不严格解码：赏金的 shell 脚本会把目标返回的原始字节直接打到 stdout
+    （`InvokeAI` 的参考 exploit 请求头带 `Accept-Encoding: gzip` 却没加 `curl --compressed`），
+    判定只看退出码，解码失败不该变成 `UnicodeDecodeError`——它会从 scorer 上抛，把整个 task 中止。
+    """
     return subprocess.run(
         command,
         cwd=cwd,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
         check=False,
         env={**os.environ, **env} if env else None,
