@@ -1,0 +1,170 @@
+"""Dataset module tests: config merge, task listing, compose generation."""
+
+from pathlib import Path
+
+import pytest
+
+from concordia_evals.cybergym_e2e import dataset
+from concordia_evals.cybergym_e2e.dataset import (
+    DEFAULT_BUILD_IMAGE,
+    list_tasks,
+    load_task_config,
+    write_compose_file,
+)
+
+
+@pytest.fixture
+def fake_repo(tmp_path: Path) -> Path:
+    """A minimal fake scripts repo with two projects / three tasks."""
+    repo = tmp_path / "repo"
+    # project alpha: project-level build_image, two tasks
+    proj = repo / "projects" / "alpha"
+    (proj / "t1").mkdir(parents=True)
+    (proj / "project.toml").write_text(
+        'name = "alpha"\n'
+        'repo_to_patch = "alpha"\n'
+        'immutable_files = ["extras/"]\n'
+        'build_image = "example/alpha:1"\n'
+    )
+    (proj / "t1" / "config.toml").write_text('task_id = "arvo:1"\n')
+    (proj / "t2").mkdir()
+    (proj / "t2" / "config.toml").write_text(
+        'task_id = "arvo:2"\nbuild_image = "example/alpha-task:2"\n'
+    )
+    # project beta: no project build_image, one task with pre_patches
+    proj_b = repo / "projects" / "beta"
+    (proj_b / "v1").mkdir(parents=True)
+    (proj_b / "project.toml").write_text('name = "beta"\nrepo_to_patch = "beta"\n')
+    (proj_b / "v1" / "config.toml").write_text(
+        'task_id = "arvo:3"\npre_patches = ["a.diff", "b.diff"]\n'
+    )
+    return repo
+
+
+def test_list_tasks(fake_repo: Path):
+    assert list_tasks(fake_repo) == ["alpha/t1", "alpha/t2", "beta/v1"]
+
+
+def test_load_task_config_merges_project_and_task(fake_repo: Path):
+    config = load_task_config("alpha/t1", fake_repo)
+    assert config["name"] == "alpha"
+    assert config["task_id"] == "arvo:1"
+    assert config["repo_to_patch"] == "alpha"
+    assert config["immutable_files"] == ["extras/"]
+    assert config["build_image"] == "example/alpha:1"
+
+
+def test_task_level_build_image_overrides_project(fake_repo: Path):
+    config = load_task_config("alpha/t2", fake_repo)
+    assert config["build_image"] == "example/alpha-task:2"
+
+
+def test_missing_build_image_falls_back_to_default(fake_repo: Path):
+    config = load_task_config("beta/v1", fake_repo)
+    assert config.get("build_image", DEFAULT_BUILD_IMAGE) == DEFAULT_BUILD_IMAGE
+    assert config["pre_patches"] == ["a.diff", "b.diff"]
+
+
+def test_unknown_task_raises(fake_repo: Path):
+    with pytest.raises(ValueError, match="Unknown task"):
+        load_task_config("alpha/nope", fake_repo)
+
+
+def test_write_compose_file(tmp_path: Path):
+    compose = write_compose_file(
+        "alpha_t1",
+        "example/alpha:1",
+        tmp_path / "data",
+        tmp_path / "scripts",
+        tmp_path / "compose",
+    )
+    content = Path(compose).read_text()
+    assert "image: example/alpha:1" in content
+    assert f"{tmp_path}/data:/task_data:ro" in content
+    assert f"{tmp_path}/scripts:/task_scripts:ro" in content
+
+
+def test_stratified_sample_diverse_and_reproducible():
+    from concordia_evals.cybergym_e2e.dataset import stratified_sample
+
+    tasks = [f"proj{p}/t{i}" for p in range(5) for i in range(10)]
+    a = stratified_sample(tasks, 12, seed=7)
+    b = stratified_sample(tasks, 12, seed=7)
+    assert a == b  # reproducible
+    assert len(a) == 12
+    projects = {t.split("/")[0] for t in a}
+    assert len(projects) == 5  # all projects represented
+    # more tasks than pools: falls back to depth
+    c = stratified_sample(["a/1", "b/1", "b/2", "b/3"], 3, seed=1)
+    assert len(c) == 3
+    # n >= len(tasks) returns everything
+    d = stratified_sample(["a/1", "b/1"], 10, seed=1)
+    assert sorted(d) == ["a/1", "b/1"]
+
+
+def test_diverse_sample(tmp_path):
+    from concordia_evals.cybergym_e2e.dataset import diverse_sample
+
+    # 构造带属性的假仓：3 个项目 × 4 题，sanitizer/source 各异
+    repo = tmp_path / "repo"
+    for p, lang in [("pa", "c++"), ("pb", "c"), ("pc", "c++")]:
+        (repo / "projects" / p).mkdir(parents=True)
+        (repo / "projects" / p / "project.toml").write_text(f'name = "{p}"\nlanguage = "{lang}"\n')
+        for i, (src, san) in enumerate(
+            [
+                ("arvo", "address"),
+                ("arvo", "memory"),
+                ("oss-fuzz", "address"),
+                ("arvo", "undefined"),
+            ]
+        ):
+            name = f"{src}_{i}" if src == "arvo" else f"oss-fuzz_{i}"
+            d = repo / "projects" / p / name
+            d.mkdir()
+            (d / "config.toml").write_text(f'task_id = "x:{i}"\n')
+            (d / "run_poc.sh").write_text(f"export SANITIZER={san}\n")
+    tasks = [
+        f"{p}/{n}" for p in ("pa", "pb", "pc") for n in ("arvo_0", "arvo_1", "oss-fuzz_2", "arvo_3")
+    ]
+    a = diverse_sample(tasks, 3, seed=5, repo_dir=repo)
+    b = diverse_sample(tasks, 3, seed=5, repo_dir=repo)
+    assert a == b and len(a) == 3
+    assert {t.split("/")[0] for t in a} == {"pa", "pb", "pc"}  # 每项目一题
+    # 项目数 > n 时也只取 n 题
+    assert len(diverse_sample(tasks, 2, seed=5, repo_dir=repo)) == 2
+
+
+class TestDownloadTaskDataGated:
+    """Gated-repo 403 (missing HF_TOKEN) must not crash optional crash.log."""
+
+    @staticmethod
+    def _cached(data_dir: Path, task_path: str, files: tuple[str, ...]) -> Path:
+        task_dir = data_dir / "projects" / task_path
+        task_dir.mkdir(parents=True)
+        for name in files:
+            (task_dir / name).write_bytes(b"x")
+        return task_dir
+
+    @staticmethod
+    def _raise_gated(**kwargs):
+        import httpx
+        from huggingface_hub.utils import GatedRepoError
+
+        request = httpx.Request("HEAD", "https://hf-mirror.com/x")
+        response = httpx.Response(403, request=request)
+        raise GatedRepoError("403 gated", response=response)
+
+    def test_gated_crash_log_skipped(self, tmp_path, monkeypatch):
+
+        task_dir = self._cached(tmp_path, "gdbm/arvo_38943", ("src.tgz", "poc.bin"))
+        monkeypatch.setattr("huggingface_hub.hf_hub_download", self._raise_gated)
+        out = dataset.download_task_data("gdbm/arvo_38943", data_dir=tmp_path)
+        assert out == task_dir
+
+    def test_gated_required_file_raises(self, tmp_path, monkeypatch):
+        from huggingface_hub.utils import GatedRepoError
+
+        self._cached(tmp_path, "gdbm/arvo_38943", ("poc.bin",))
+        monkeypatch.setattr("huggingface_hub.hf_hub_download", self._raise_gated)
+        with pytest.raises(GatedRepoError):
+            dataset.download_task_data("gdbm/arvo_38943", data_dir=tmp_path)

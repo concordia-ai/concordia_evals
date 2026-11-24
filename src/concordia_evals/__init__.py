@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from concordia_evals.cot_control import cot_control
     from concordia_evals.cot_immediacy import cot_immediacy
     from concordia_evals.cot_process import cot_process
+    from concordia_evals.cybergym_e2e import cybergym_e2e
     from concordia_evals.no_cot import no_cot
 
 __version__ = "0.1.0"
@@ -18,6 +19,7 @@ __all__ = [
     "cot_control",
     "cot_immediacy",
     "cot_process",
+    "cybergym_e2e",
     "no_cot",
 ]
 
@@ -26,6 +28,7 @@ _TASK_MODULES = {
     "cot_control": "concordia_evals.cot_control.cot_control",
     "cot_immediacy": "concordia_evals.cot_immediacy.cot_immediacy",
     "cot_process": "concordia_evals.cot_process.cot_process",
+    "cybergym_e2e": "concordia_evals.cybergym_e2e.cybergym_e2e",
     "no_cot": "concordia_evals.no_cot.no_cot",
 }
 

@@ -39,6 +39,7 @@ dependencies = [
     "beautifulsoup4 >= 4.10.0",
     "jinja2",
     "requests",
+    "inspect-swe>=0.2.72",
 ]
 
 [project.optional-dependencies]
@@ -66,6 +67,8 @@ where = ["src"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+# Vendored third-party files stay byte-identical to upstream.
+exclude = ["src/concordia_evals/cybergym_e2e/vendor"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "D", "NPY", "PLE", "PLR", "PLW"]
@@ -97,6 +100,15 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["datasets", "datasets.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tomli", "tomli.*"]
+ignore_missing_imports = true
+
+# Vendored upstream file: byte-identical copy, not type-checked.
+[[tool.mypy.overrides]]
+module = ["concordia_evals.cybergym_e2e.vendor.validate"]
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
@@ -142,4 +154,5 @@ markers = [
     "dataset_download: tests that download datasets",
     "slow: marks tests that are slow to run; enable with --runslow or RUN_SLOW_TESTS=1",
     "docker: marks tests that pull or build docker images",
+    "docker_smoke: end-to-end pipeline smoke tests requiring docker (slow)",
 ]

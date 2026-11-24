@@ -8,6 +8,11 @@ from concordia_evals.cot_control import cot_control, cot_control_qa_scorer
 from concordia_evals.cot_immediacy import cot_immediacy, cot_immediacy_judge_scorer
 from concordia_evals.cot_process import cot_process, openai_process_scorer
 from concordia_evals.cve_bench import cve_bench
+from concordia_evals.cybergym_e2e.cybergym_e2e import cybergym_e2e
+from concordia_evals.cybergym_e2e.scorer import (
+    cybergym_e2e_scorer,
+    cybergym_e2e_scorer_both,
+)
 from concordia_evals.exploitbench import exploitbench
 from concordia_evals.exploitgym import exploitgym
 from concordia_evals.no_cot import (
@@ -29,6 +34,9 @@ __all__ = [
     "cot_immediacy_judge_scorer",
     "cot_process",
     "cve_bench",
+    "cybergym_e2e",
+    "cybergym_e2e_scorer",
+    "cybergym_e2e_scorer_both",
     "exploitbench",
     "exploitgym",
     "no_cot",
