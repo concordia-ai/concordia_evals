@@ -1593,6 +1593,30 @@ def test_pin_build_mirrors_adds_the_pins_of_a_sample_that_no_longer_builds(
     assert "RUN printf '%s\\n' \"setuptools<81\" > /opt/build-constraints.txt" in text
 
 
+def test_pin_build_mirrors_sets_the_environment_of_a_sample_that_needs_it(
+    tmp_path: Path,
+) -> None:
+    """The build has to see the variable before the step that needs it."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "Dockerfile").write_text("FROM base\nRUN pip install -e /codebase\n")
+
+    pin_build_mirrors(
+        root, fix=BuildFix(env=(("ONNXRUNTIME_NODE_INSTALL_CUDA", "skip"),))
+    )
+
+    text = (root / "Dockerfile").read_text()
+    assert "ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip" in text.splitlines()
+    assert text.index("ONNXRUNTIME_NODE_INSTALL_CUDA") < text.index("pip install")
+
+
+def test_the_open_webui_fix_skips_the_onnxruntime_cuda_download() -> None:
+    """The asset it asks for is gone, and the CPU binaries already ship in the package."""
+    assert ("ONNXRUNTIME_NODE_INSTALL_CUDA", "skip") in environment.BUILD_FIXES[
+        "open-webui"
+    ].env
+
+
 def test_pin_build_mirrors_only_rewrites_the_host_of_a_sample(tmp_path: Path) -> None:
     """A dropped package repository is replaced, nothing else is added."""
     root = tmp_path / "workspace"

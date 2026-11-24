@@ -93,7 +93,10 @@ INSTALL_TIMEOUT = int(os.environ.get("BOUNTYBENCH_INSTALL_TIMEOUT", "7200"))
 HEALTHCHECK_TIMEOUT = 300
 
 # Build of the image of a target stack (apt and pip of the sample, once per sample).
-STACK_BUILD_TIMEOUT = 3600
+# As expensive as the sandbox install: `open-webui` downloads 4GB (the CUDA
+# toolkit of `torch`), which measured 6 minutes on one run and had not finished
+# after 55 minutes on another.
+STACK_BUILD_TIMEOUT = INSTALL_TIMEOUT
 # Upstream caps invariant test execution at 90 minutes.
 INVARIANTS_TIMEOUT = 5400
 INVARIANTS_RETRY = 3

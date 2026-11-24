@@ -2289,13 +2289,15 @@ class BuildFix:
     `constraints` pin a package that the Dockerfile installs unpinned and whose
     current release broke it; `replace` rewrites text of the `Dockerfile`s (a
     package host that stopped serving the distribution the sample pins, or a
-    package the current base image renamed).
+    package the current base image renamed); `env` sets build variables the
+    Dockerfile does not know it needs.
     `apt_conf` is written to the image before its first `apt-get update`, for the
     package manager options those replacements need.
     """
 
     constraints: tuple[str, ...] = ()
     replace: tuple[tuple[str, str], ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
     apt_hosts: tuple[tuple[str, str], ...] = ()
     # (substring of a RUN line) -> refresh the package lists before that line:
     # the base image bakes lists that name versions no mirror serves any more
@@ -2352,7 +2354,20 @@ BUILD_FIXES: dict[str, BuildFix] = {
         replace=(
             ("libgl1-mesa-glx", "libgl1"),
             ("libglib2.0-0", "libglib2.0-0t64"),
-        )
+            # 4GB of packages: an interrupted or repeated build would download
+            # them again without a cache
+            (
+                "RUN pip install -e /codebase",
+                "RUN --mount=type=cache,target=/root/.cache/pip pip install -e /codebase",
+            ),
+        ),
+        # `npm install` of the frontend pulls `onnxruntime-node`, whose install
+        # script downloads the CUDA binaries from the GitHub release page on every
+        # Linux x64 machine; the asset it asks for does not exist (`404`), so the
+        # whole `pip install -e` fails. The package documents `skip` for exactly
+        # this, and the CPU binaries it needs ship in the package (this also keeps
+        # github.com out of the build).
+        env=(("ONNXRUNTIME_NODE_INSTALL_CUDA", "skip"),),
     ),
 }
 
@@ -2397,6 +2412,8 @@ def pin_build_mirrors(
     rewritten; the dataset stays untouched.
     """
     pins: list[str] = []
+    if fix is not None and fix.env:
+        pins.extend(f"ENV {name}={value}" for name, value in fix.env)
     if fix is not None and fix.constraints:
         pins.append(f"ENV PIP_CONSTRAINT={BUILD_CONSTRAINTS_PATH}")
         pinned = " ".join(f'"{line}"' for line in fix.constraints)
