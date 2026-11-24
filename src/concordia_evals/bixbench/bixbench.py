@@ -8,9 +8,11 @@ Paper: https://arxiv.org/abs/2502.09839
 Dataset: https://huggingface.co/datasets/futurehouse/BixBench
 """
 
+import ast
 import json
 import logging
 import os
+import re
 import shutil
 import string
 from pathlib import Path
@@ -33,7 +35,6 @@ from inspect_ai.solver import (
     Solver,
     TaskState,
     basic_agent,
-    chain,
     solver,
     system_message,
 )
@@ -338,6 +339,18 @@ if __name__ == "__main__":
 
 logger = logging.getLogger(__name__)
 
+# The dataset labels every question with the grading mode its reference answer
+# requires. "llm_verifier" answers are free text, "str_verifier" answers must be
+# compared as normalized strings, and "range_verifier" answers are numeric
+# intervals such as "(0.74,0.77)". Grading every mode with one generic LLM
+# prompt (the previous behaviour) marks answers that sit inside a reference
+# range as wrong, so the mode is carried into sample metadata and dispatched on
+# in the scorer.
+EvalMode = Literal["llm_verifier", "str_verifier", "range_verifier"]
+
+DEFAULT_JUDGE_MODEL = "openai/gpt-4o"
+RANGE_BOUND_COUNT = 2
+
 OPEN_ENDED_EVAL_PROMPT = """
 Here is a question, the correct answer to the question, and a proposed answer.
 Question: {question}
@@ -346,6 +359,106 @@ Proposed answer: {proposed_answer}
 You must respond with a binary score (0 or 1) for whether the proposed answer is equivalent to the correct answer.
 Nothing else is permitted.
 """
+
+OPEN_ENDED_RANGE_EVAL_PROMPT = """
+Here is a question, a target range written as (lower,upper), and a proposed answer.
+Question: {question}
+Target range: {correct_answer}
+Proposed answer: {proposed_answer}
+The proposed answer is correct if the value it reports falls inside the target range (bounds included), even when it is written differently, e.g. as a percentage, with different rounding, or with explanatory text. It is incorrect if it falls outside the range. If the proposed answer reports no value that can be compared to the range, it is incorrect.
+You must respond with a binary score (0 or 1). Nothing else is permitted.
+"""
+
+_ANSWER_TAG = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
+_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+_FIRST_SCORE = re.compile(r"(?<![\d.])([01])(?![\d.])")
+
+
+def extract_answer(completion: str) -> str:
+    """Return the value inside the last ``<answer>`` tag, else the completion.
+
+    The task prompt asks the agent to answer as ``<answer>value</answer>``;
+    comparing or judging the whole completion otherwise pulls in the agent's
+    surrounding prose.
+
+    Args:
+        completion: The raw completion produced by the solver.
+
+    Returns:
+        The extracted answer text, stripped.
+    """
+    matches = _ANSWER_TAG.findall(completion or "")
+    answer = matches[-1] if matches else (completion or "")
+    return answer.strip()
+
+
+def parse_range(target: str) -> tuple[float, float] | None:
+    """Parse a ``(lower,upper)`` reference range.
+
+    Args:
+        target: The sample's target text, e.g. ``"(0.74,0.77)"``.
+
+    Returns:
+        The lower and upper bound, or ``None`` when the target is not a range.
+    """
+    try:
+        value = ast.literal_eval(target.strip())
+    except (ValueError, SyntaxError):
+        return None
+    if (
+        isinstance(value, tuple)
+        and len(value) == RANGE_BOUND_COUNT
+        and all(isinstance(bound, (int, float)) for bound in value)
+    ):
+        return float(value[0]), float(value[1])
+    return None
+
+
+def parse_number(answer: str) -> float | None:
+    """Parse the first number an answer reports.
+
+    Args:
+        answer: The extracted answer text.
+
+    Returns:
+        The number, or ``None`` when the answer reports no number.
+    """
+    match = _NUMBER.search(answer.replace(",", ""))
+    return float(match.group()) if match else None
+
+
+def grade_range(target: str, answer: str) -> bool | None:
+    """Grade a numeric answer against a reference range.
+
+    Bounds are inclusive, matching the original BixBench bounds check.
+
+    Args:
+        target: The reference range, e.g. ``"(0.74,0.77)"``.
+        answer: The extracted answer text.
+
+    Returns:
+        Whether the answer lies in the range, or ``None`` when the answer
+        reports no number and an LLM judge has to decide.
+    """
+    bounds = parse_range(target)
+    number = parse_number(answer)
+    if bounds is None or number is None:
+        return None
+    lower, upper = bounds
+    return lower <= number <= upper
+
+
+def normalize_answer(answer: str) -> str:
+    """Normalize an answer for exact comparison, as the original grader does.
+
+    Args:
+        answer: The extracted answer text.
+
+    Returns:
+        The lowercased answer with everything but letters and digits removed.
+    """
+    return re.sub(r"[^a-zA-Z0-9]", "", answer).lower()
+
 
 CAPSULE_SYSTEM_PROMPT_OPEN = """
 You are an expert bioinformatician and seasoned biological data scientist.
@@ -877,26 +990,39 @@ print("Initialized notebook.ipynb with rpy2 extension")
     return solve
 
 
+def bixbench_tools() -> list[Tool]:
+    """Return the notebook tools used by the default agent.
+
+    Exported so a custom solver can be given the same notebook interface the
+    default agent has, instead of only raw sandbox access.
+
+    Returns:
+        The edit-cell, view-notebook and list-workdir tools.
+    """
+    return [
+        _edit_cell(),
+        _view_notebook(),
+        _list_workdir(),
+    ]
+
+
 def default_solver(max_messages: int = DEFAULT_MAX_MESSAGES) -> Solver:
-    """Return the default solver for BixBench.
+    """Return the default agent for BixBench.
+
+    Environment initialization is *not* part of this chain: it lives on the
+    task's ``setup`` step so that a custom solver replaces the agent without
+    also losing the notebook, the rpy2 kernel and the cell runner.
 
     Args:
         max_messages: Maximum number of messages allowed.
 
     Returns:
-        A solver chain that initializes the environment and runs the agent.
+        The default agent, prefixed with the capsule system prompt.
     """
-    return chain(
-        _init_environment(),
-        basic_agent(
-            init=[system_message(CAPSULE_SYSTEM_PROMPT_OPEN)],
-            tools=[
-                _edit_cell(),
-                _view_notebook(),
-                _list_workdir(),
-            ],
-            max_messages=max_messages,
-        ),
+    return basic_agent(
+        init=[system_message(CAPSULE_SYSTEM_PROMPT_OPEN)],
+        tools=bixbench_tools(),
+        max_messages=max_messages,
     )
 
 
@@ -905,49 +1031,100 @@ def default_solver(max_messages: int = DEFAULT_MAX_MESSAGES) -> Solver:
         "accuracy": [accuracy(), stderr()],
     }
 )
-def bixbench_scorer(judge_model: str | None = None) -> Scorer:
-    """Scorer for BixBench open-ended questions.
+async def _judge_boolean(prompt: str, judge_model: str) -> tuple[bool, str]:
+    """Ask an LLM judge for a binary score.
 
-    Uses an LLM to judge whether the proposed answer is equivalent to the
-    correct answer, returning a binary score (0 or 1).
+    Args:
+        prompt: The fully formatted grading prompt.
+        judge_model: Model name to grade with.
+
+    Returns:
+        The parsed verdict and the judge's raw response.
+    """
+    model = get_model(judge_model)
+    result = await model.generate([ChatMessageUser(content=prompt)])
+    response = result.completion.strip()
+
+    match = _FIRST_SCORE.search(response)
+    if match:
+        correct = match.group(1) == "1"
+    else:
+        # Fallback: try to parse more leniently
+        correct = "1" in response and response.count("1") > response.count("0")
+    return correct, response
+
+
+@scorer(
+    metrics={
+        "accuracy": [accuracy(), stderr()],
+    }
+)
+def bixbench_scorer(judge_model: str | None = None) -> Scorer:
+    """Scorer for BixBench open-ended questions, dispatching on grading mode.
+
+    Reference answers come in three shapes and are graded accordingly, as the
+    original BixBench grader does:
+
+    - ``range_verifier``: the target is a numeric interval and is checked
+      deterministically with an inclusive bounds test. Answers that report no
+      number fall back to an LLM judge told the bounds are inclusive.
+    - ``str_verifier``: the target is compared as a normalized string (exact,
+      then substring) before falling back to the LLM judge.
+    - ``llm_verifier`` (and any unlabelled sample): the LLM judge decides.
 
     Args:
         judge_model: Model to use for grading. Defaults to the
-            INSPECT_EVALS_JUDGE_MODEL environment variable, or openai/gpt-4o if
-            neither is set.
+            INSPECT_EVALS_JUDGE_MODEL environment variable, or
+            DEFAULT_JUDGE_MODEL if neither is set.
     """
     if judge_model is None:
-        judge_model = os.environ.get("INSPECT_EVALS_JUDGE_MODEL", "openai/gpt-4o")
+        judge_model = os.environ.get("INSPECT_EVALS_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
 
     async def score(state: TaskState, target: Target) -> Score:
-        prompt = OPEN_ENDED_EVAL_PROMPT.format(
-            question=state.metadata["question"],
-            correct_answer=target.text,
-            proposed_answer=state.output.completion,
-        )
+        eval_mode: EvalMode = state.metadata.get("eval_mode", "llm_verifier")
+        question = state.metadata["question"]
+        answer = extract_answer(state.output.completion)
 
-        model = get_model(judge_model)
-        result = await model.generate([ChatMessageUser(content=prompt)])
+        verdict: bool | None = None
+        explanation = ""
 
-        score_text = result.completion.strip()
-        # Extract just the first digit if there's extra text
-        first_digit = None
-        for char in score_text:
-            if char in "01":
-                first_digit = char
-                break
+        if eval_mode == "range_verifier":
+            verdict = grade_range(target.text, answer)
+            if verdict is not None:
+                explanation = (
+                    f"{answer!r} checked against range {target.text}: "
+                    f"{'inside' if verdict else 'outside'} the bounds"
+                )
 
-        if first_digit == "1":
-            correct = True
-        elif first_digit == "0":
-            correct = False
-        else:
-            # Fallback: try to parse more leniently
-            correct = "1" in score_text and score_text.count("1") > score_text.count("0")
+        elif eval_mode == "str_verifier":
+            normalized_target = normalize_answer(target.text)
+            normalized_answer = normalize_answer(answer)
+            if normalized_answer == normalized_target:
+                verdict = True
+            elif normalized_answer and normalized_answer in normalized_target:
+                verdict = True
+            if verdict is not None:
+                explanation = f"{answer!r} matches {target.text!r} as a string"
+
+        if verdict is None:
+            if eval_mode == "range_verifier":
+                prompt = OPEN_ENDED_RANGE_EVAL_PROMPT.format(
+                    question=question,
+                    correct_answer=target.text,
+                    proposed_answer=answer,
+                )
+            else:
+                prompt = OPEN_ENDED_EVAL_PROMPT.format(
+                    question=question,
+                    correct_answer=target.text,
+                    proposed_answer=answer,
+                )
+            verdict, response = await _judge_boolean(prompt, judge_model)
+            explanation = f"Grading model response: {response}"
 
         return Score(
-            value={"accuracy": 1 if correct else 0},
-            explanation=f"Grading model response: {score_text}",
+            value={"accuracy": 1 if verdict else 0},
+            explanation=explanation,
             answer=state.output.completion,
         )
 
@@ -1038,6 +1215,7 @@ def bixbench(
                     "distractors": item["distractors"],
                     "question": item["question"],
                     "capsule_uuid": item.get("capsule_uuid", ""),
+                    "eval_mode": item.get("eval_mode", "llm_verifier"),
                 },
             )
         )
@@ -1049,6 +1227,10 @@ def bixbench(
 
     return Task(
         dataset=MemoryDataset(samples=samples),
+        # Environment initialization is a setup step, not part of the solver:
+        # Inspect always runs setup, so replacing the agent with a custom solver
+        # (e.g. an inspect_swe harness) no longer silently drops the notebook.
+        setup=_init_environment(),
         solver=solver or default_solver(max_messages),
         scorer=scorer or bixbench_scorer(judge_model=judge_model),
         epochs=epochs,

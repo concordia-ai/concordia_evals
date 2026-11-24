@@ -4,6 +4,9 @@ import string
 from pathlib import Path
 
 import pytest
+from inspect_ai.model import ModelOutput
+from inspect_ai.scorer import Target
+from inspect_ai.solver import TaskState, generate
 
 from concordia_evals.bixbench.bixbench import (
     CELL_TIMEOUT_SECONDS,
@@ -13,6 +16,10 @@ from concordia_evals.bixbench.bixbench import (
     _get_compose_file,
     _prepare_capsule_data,
     bixbench,
+    bixbench_scorer,
+    extract_answer,
+    grade_range,
+    parse_range,
 )
 
 
@@ -97,3 +104,97 @@ def test_bixbench_task_creation() -> None:
     assert "ideal" in sample.metadata
     assert sample.sandbox is not None
     assert sample.sandbox.type == "docker"
+
+
+def test_parse_range_accepts_dataset_formats() -> None:
+    """Reference ranges are parsed in the formats the dataset actually uses."""
+    assert parse_range("(0.74,0.77)") == (0.74, 0.77)
+    assert parse_range("(0.6 , 0.7)") == (0.6, 0.7)
+    assert parse_range("(24,26)") == (24.0, 26.0)
+
+
+def test_parse_range_rejects_non_ranges() -> None:
+    """Answers that are not a bound pair are not treated as ranges."""
+    assert parse_range("0.05") is None
+    assert parse_range("35%") is None
+    assert parse_range("(1.0,2.0,3.0)") is None
+
+
+def test_extract_answer_prefers_answer_tag() -> None:
+    """The graded value comes from the answer tag, not the surrounding prose."""
+    assert extract_answer("Some reasoning.\n<answer> 0.755 </answer>") == "0.755"
+    assert extract_answer("<answer>1</answer> and <answer>2</answer>") == "2"
+    assert extract_answer("no tags here") == "no tags here"
+
+
+def test_grade_range_uses_inclusive_bounds() -> None:
+    """Values on or inside the bounds are correct; outside is incorrect."""
+    assert grade_range("(0.74,0.77)", "0.74") is True
+    assert grade_range("(0.74,0.77)", "0.77") is True
+    assert grade_range("(0.74,0.77)", "0.755") is True
+    assert grade_range("(0.74,0.77)", "0.9") is False
+
+
+def test_grade_range_parses_numbers_out_of_prose() -> None:
+    """An answer that states its value in prose is still graded numerically."""
+    assert grade_range("(0.74,0.77)", "roughly 0.75") is True
+    assert grade_range("(0.74,0.77)", "about 1,200 counts") is False
+
+
+def test_grade_range_defers_to_judge_without_a_number() -> None:
+    """A non-numeric answer returns None so the LLM judge decides."""
+    assert grade_range("(0.74,0.77)", "no idea") is None
+    assert grade_range("(0.74,0.77)", "") is None
+
+
+@pytest.mark.anyio
+async def test_scorer_grades_range_without_calling_judge() -> None:
+    """range_verifier samples are graded deterministically, with no judge call."""
+    scorer_fn = bixbench_scorer(judge_model="mockllm/model")
+    state = TaskState(
+        model="mockllm/model",
+        sample_id="bix-1-q1",
+        epoch=1,
+        input="q",
+        messages=[],
+        output=ModelOutput.from_content("mockllm/model", "<answer>0.755</answer>"),
+        metadata={"question": "What fraction?", "eval_mode": "range_verifier"},
+    )
+
+    score = await scorer_fn(state, Target("(0.74,0.77)"))
+    assert score.value["accuracy"] == 1
+    assert "inside the bounds" in (score.explanation or "")
+
+    state.output = ModelOutput.from_content("mockllm/model", "<answer>0.9</answer>")
+    score = await scorer_fn(state, Target("(0.74,0.77)"))
+    assert score.value["accuracy"] == 0
+
+
+@pytest.mark.anyio
+async def test_scorer_str_verifier_matches_normalized_string() -> None:
+    """str_verifier samples compare normalized strings before judging."""
+    scorer_fn = bixbench_scorer(judge_model="mockllm/model")
+    state = TaskState(
+        model="mockllm/model",
+        sample_id="bix-1-q1",
+        epoch=1,
+        input="q",
+        messages=[],
+        output=ModelOutput.from_content("mockllm/model", "<answer>1.9E-05</answer>"),
+        metadata={"question": "What p-value?", "eval_mode": "str_verifier"},
+    )
+
+    score = await scorer_fn(state, Target("1.9E-05"))
+    assert score.value["accuracy"] == 1
+
+
+@pytest.mark.dataset_download
+def test_custom_solver_keeps_environment_setup() -> None:
+    """A custom solver must not drop environment initialization."""
+    task = bixbench(solver=generate(), limit=1)
+    assert task.setup is not None
+    assert task.dataset[0].metadata["eval_mode"] in {
+        "llm_verifier",
+        "str_verifier",
+        "range_verifier",
+    }

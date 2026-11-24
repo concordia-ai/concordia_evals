@@ -35,7 +35,7 @@ eval(bixbench, model="openai/gpt-4o")
 - `data_dir` (Path | str | None): Directory for downloaded capsule data (default: `None`)
 - `limit` (int | None): Maximum number of samples to include (default: `None`)
 - `avoid_images` (bool): Whether to instruct the agent to avoid plots/images (default: `True`)
-- `judge_model` (str | None): Model to use for grading open-ended answers. If not provided, the `INSPECT_EVALS_JUDGE_MODEL` environment variable is used; otherwise it defaults to `openai/gpt-4o`.
+- `judge_model` (str | None): Model to use for grading open-ended answers. If not provided, the `INSPECT_EVALS_JUDGE_MODEL` environment variable is used; otherwise it defaults to `openai/gpt-4o`. A stronger reasoning model is worth setting here, since the judge is what decides free-text equivalence.
 
 ## Docker environment
 
@@ -55,9 +55,29 @@ The `Dockerfile` in `src/concordia_evals/bixbench/` uses four Bioconductor annot
 
 ## Scoring
 
-BixBench uses an LLM-as-a-judge scorer for open-ended questions. The grading model compares the agent's proposed answer with the correct answer and returns a binary score (0 or 1) indicating equivalence.
+BixBench reference answers come in three forms, and each is graded the way the original BixBench grader does:
+
+- `range_verifier` (61 questions): the reference answer is a numeric interval such as `(0.74,0.77)`. The value the agent reports is checked with an inclusive bounds test, so an answer inside the range scores 1 even when it is written differently. Answers that report no number fall back to an LLM judge told that the bounds are inclusive.
+- `str_verifier` (61 questions): the answer is compared to the reference as a normalized string (exact, then substring) before falling back to the LLM judge.
+- `llm_verifier` (83 questions): an LLM judge decides.
+
+Answers are read from the `<answer>` tag the task prompt asks for, so the agent's surrounding prose is not graded.
+
+Grading every mode with one generic prompt (the earlier behaviour) marked answers that sat inside a reference range as wrong.
 
 **Note on coverage:** This implementation only supports the **open-answer** judging mode. The original BixBench paper also defines a multiple-choice question (MCQ) judging mode using the provided distractor answers; that mode is **not** implemented here.
+
+## Customizing the solver
+
+Environment initialization (the notebook skeleton with the rpy2 cell and the persistent-kernel runner) is a task **setup** step, not part of the solver. Inspect always runs setup, so a custom solver such as an `inspect_swe` harness keeps the initialized environment instead of silently running against a bare container.
+
+A custom solver still replaces the agent, and with it the notebook tools and system prompt. `bixbench_tools()` returns the `edit_cell` / `view_notebook` / `list_workdir` tools so a custom agent can be given the same interface:
+
+```python
+from concordia_evals.bixbench.bixbench import bixbench, bixbench_tools
+
+bixbench(solver=my_agent(tools=bixbench_tools()))
+```
 
 ## Dataset
 
