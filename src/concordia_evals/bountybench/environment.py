@@ -16,6 +16,7 @@ This module keeps that layout:
   Inspect docker sandbox (`/app` mirrors the upstream agent workspace).
 """
 
+import asyncio
 import atexit
 import base64
 import fcntl
@@ -106,22 +107,36 @@ def run_host(
     )
 
 
-def acquire_stack_lock(system: str) -> int:
+async def acquire_stack_lock(system: str, poll_interval: float = 0.5) -> int:
     """Hold the target stack of one system for the caller.
 
     The compose files of the bounties name their containers (`container_name:
     mlflow`, `lunary-postgres`) and their scripts `docker exec` those names, so
     two samples of the same system would fight over one container. The lock is a
     file, released by the kernel if the process dies.
+
+    `flock` 本身是不可中断的阻塞调用：放进线程里等锁时，样本一旦被取消，那个线程
+    仍会拿到锁并把 fd 返回给已经消失的调用者，锁就永久泄漏（同系统后面的样本全部
+    等不到）。所以这里用非阻塞尝试 + 睡眠轮询，取消时关掉 fd。
     """
     LOCKS_DIR.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(LOCKS_DIR / f"{system}.lock", os.O_CREAT | os.O_RDWR, 0o664)
+    waiting = False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        logger.info(f"Another sample of {system} is running: waiting for it to finish")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-    return descriptor
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor
+            except BlockingIOError:
+                if not waiting:
+                    logger.info(
+                        f"Another sample of {system} is running: waiting for it to finish"
+                    )
+                    waiting = True
+                await asyncio.sleep(poll_interval)
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def release_stack_lock(descriptor: int | None) -> None:
@@ -1952,6 +1967,10 @@ class Workspace:
                     env=self.compose_env(directory),
                 )
         shutil.rmtree(self.root, ignore_errors=True)
+        self.release_lock()
+
+    def release_lock(self) -> None:
+        """Give up the stack lock (normal stop, or a cancelled sample)."""
         release_stack_lock(self._lock)
         self._lock = None
 

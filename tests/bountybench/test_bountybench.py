@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import tarfile
-import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -949,7 +948,11 @@ _REAL_RELEASE_LOCK = environment.release_stack_lock
 @pytest.fixture(autouse=True)
 def _no_stack_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     """The lock serializes real runs of a system; the tests do not take it."""
-    monkeypatch.setattr(environment, "acquire_stack_lock", lambda system: None)
+
+    async def no_lock(system: str) -> int:
+        return 0
+
+    monkeypatch.setattr(environment, "acquire_stack_lock", no_lock)
     monkeypatch.setattr(environment, "release_stack_lock", lambda descriptor: None)
 
 
@@ -1753,18 +1756,109 @@ def test_stack_lock_is_exclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(environment, "LOCKS_DIR", tmp_path)
     monkeypatch.setattr(environment, "acquire_stack_lock", _REAL_ACQUIRE_LOCK)
     monkeypatch.setattr(environment, "release_stack_lock", _REAL_RELEASE_LOCK)
-    held = environment.acquire_stack_lock("demoapp")
-    waited: list[int] = []
-    thread = threading.Thread(
-        target=lambda: waited.append(environment.acquire_stack_lock("demoapp"))
+
+    async def scenario() -> None:
+        held = await environment.acquire_stack_lock("demoapp")
+        waiting = asyncio.create_task(
+            environment.acquire_stack_lock("demoapp", poll_interval=0.01)
+        )
+        await asyncio.sleep(0.1)
+        # the second caller is still waiting for the first sample
+        assert not waiting.done()
+
+        environment.release_stack_lock(held)
+        environment.release_stack_lock(await asyncio.wait_for(waiting, timeout=5))
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_a_lock_wait_does_not_keep_the_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled wait must not hold the lock: `flock` in a thread keeps it forever."""
+    monkeypatch.setattr(environment, "LOCKS_DIR", tmp_path)
+    monkeypatch.setattr(environment, "acquire_stack_lock", _REAL_ACQUIRE_LOCK)
+    monkeypatch.setattr(environment, "release_stack_lock", _REAL_RELEASE_LOCK)
+
+    async def scenario() -> None:
+        held = await environment.acquire_stack_lock("demoapp")
+        waiting = asyncio.create_task(
+            environment.acquire_stack_lock("demoapp", poll_interval=0.01)
+        )
+        await asyncio.sleep(0.1)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+        environment.release_stack_lock(held)
+        # the cancelled waiter left no descriptor behind
+        again = await asyncio.wait_for(
+            environment.acquire_stack_lock("demoapp", poll_interval=0.01), timeout=5
+        )
+        environment.release_stack_lock(again)
+
+    asyncio.run(scenario())
+
+
+def test_setup_takes_the_sandbox_before_the_stack_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Holding the stack lock while queued for a sandbox slot deadlocks the task.
+
+    Sandboxes are capped process-wide (`max_sandboxes`), so a sample that waits
+    for a slot while holding a system's lock blocks every other sample of that
+    system, including the one holding a slot and waiting for the same lock.
+    """
+    from inspect_ai.model import ChatMessageUser, get_model
+    from inspect_ai.solver import TaskState
+
+    task_module = importlib.import_module("concordia_evals.bountybench.bountybench")
+    calls: list[str] = []
+
+    class _FakeWorkspace:
+        root = Path("/tmp/demoapp_bounty_0-workspace")
+
+        @classmethod
+        def create(cls, spec: Any, lock: int | None = None) -> "_FakeWorkspace":
+            calls.append("create")
+            return cls()
+
+        def start(self, bounty_setup: bool = True) -> None:
+            calls.append("start")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+    async def fake_init_sandbox(sbx: Any, spec: Any) -> None:
+        calls.append("init_sandbox")
+
+    async def fake_acquire(system: str) -> int:
+        calls.append("lock")
+        return 1
+
+    async def fake_listing(sbx: Any) -> str:
+        calls.append("listing")
+        return ""
+
+    from types import SimpleNamespace
+
+    spec = SimpleNamespace(system="demoapp")
+    monkeypatch.setattr(task_module, "load_bounty_spec", lambda metadata: spec)
+    monkeypatch.setattr(task_module, "sandbox", lambda: calls.append("sandbox") or object())
+    monkeypatch.setattr(task_module, "init_sandbox", fake_init_sandbox)
+    monkeypatch.setattr(task_module, "acquire_stack_lock", fake_acquire)
+    monkeypatch.setattr(task_module, "Workspace", _FakeWorkspace)
+    monkeypatch.setattr(task_module, "codebase_listing", fake_listing)
+    monkeypatch.setattr(task_module, "render_prompt", lambda text, codebase="": "prompt")
+    monkeypatch.setattr(task_module, "release_stack_lock", lambda descriptor: None)
+
+    state = TaskState(
+        model=get_model("mockllm/model"),
+        sample_id="demoapp_bounty_0",
+        epoch=1,
+        input="go",
+        messages=[ChatMessageUser(content="go")],
+        metadata={"task_type": "exploit"},
     )
-    thread.start()
-    thread.join(timeout=0.5)
+    asyncio.run(task_module.setup_bountybench()(state, None))
 
-    # the second caller is still waiting for the first sample
-    assert waited == []
-
-    environment.release_stack_lock(held)
-    thread.join(timeout=5)
-    assert len(waited) == 1
-    environment.release_stack_lock(waited[0])
+    assert calls.index("sandbox") < calls.index("lock")
+    assert calls.index("lock") < calls.index("create")

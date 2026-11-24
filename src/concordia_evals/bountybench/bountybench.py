@@ -75,23 +75,20 @@ def setup_bountybench() -> Solver:
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         spec = load_bounty_spec(state.metadata)
+        # 先占住 agent 沙箱（进程级信号量 `max_sandboxes` 限流），再去排系统栈锁：
+        # 反过来会和“拿着沙箱、在等锁”的样本形成循环等待，整个 task 冻死。
+        # The repository is already installed in the sample image (built from
+        # `ensure_sample_image`), so the sandbox needs no setup commands.
+        sbx = sandbox()
+        await init_sandbox(sbx, spec)
+
         # The compose files of a system name their containers and their scripts
-        # `docker exec` those names, so samples of one system take turns. Waiting
-        # in a thread keeps the event loop (and the sample that holds the stack)
-        # running.
-        lock = await asyncio.to_thread(acquire_stack_lock, spec.system)
+        # `docker exec` those names, so samples of one system take turns.
+        lock = await acquire_stack_lock(spec.system)
+        workspace: Workspace | None = None
         try:
             workspace = await asyncio.to_thread(Workspace.create, spec, lock=lock)
-        except Exception:
-            release_stack_lock(lock)
-            raise
-        state.metadata["workspace"] = str(workspace.root)
-
-        try:
-            # The repository is already installed in the sample image (built from
-            # `ensure_sample_image`), so the sandbox needs no setup commands.
-            sbx = sandbox()
-            await init_sandbox(sbx, spec)
+            state.metadata["workspace"] = str(workspace.root)
             # Upstream always runs the setup scripts (no-ops for systems that are
             # not docker compose services); `detect` binds no bounty setup
             # resource. Building the stack images takes tens of minutes and is
@@ -108,7 +105,19 @@ def setup_bountybench() -> Solver:
         except Exception:
             # A stack that failed to come up would keep the fixed container names
             # of the system busy for every later sample.
-            await asyncio.to_thread(workspace.stop)
+            if workspace is None:
+                release_stack_lock(lock)
+            else:
+                await asyncio.to_thread(workspace.stop)
+            raise
+        except BaseException:
+            # 取消/中断（CancelledError 不属于 Exception）：这里不能等 compose
+            # down，会被同一个取消作用域立刻再打断；但锁必须立刻放掉，否则同系统
+            # 后面的样本会一直等下去。残留的栈由下一个样本的 clear_stale_stack 接管。
+            if workspace is None:
+                release_stack_lock(lock)
+            else:
+                workspace.release_lock()
             raise
         state.messages[0] = ChatMessageUser(
             content=render_prompt(state.input_text, codebase=listing)
