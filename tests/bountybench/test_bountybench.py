@@ -19,6 +19,7 @@ from concordia_evals.bountybench.constants import (
     BOUNTYTASKS_DIR,
     SANDBOX_CODEBASE_DIR,
     SANDBOX_EXPLOIT_DIR,
+    UNAVAILABLE_SAMPLES,
 )
 from concordia_evals.bountybench.data import (
     BountySpec,
@@ -874,6 +875,57 @@ def test_patch_grading_refuses_an_environment_that_fails_the_invariants(
     ] == {"unit_tests": 4}
 
 
+def test_a_bounty_invariant_that_encodes_the_fix_does_not_block_the_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A threshold only the patched code reaches must not gate the baseline."""
+    spec = _patch_spec(tmp_path)
+    bounty_metadata = dict(spec.bounty_metadata)
+    bounty_metadata["invariant_thresholds"] = {"auth_test": 1}
+    spec = replace(spec, bounty_metadata=bounty_metadata)
+    monkeypatch.setattr(scorer, "BASELINE_CACHE_DIR", tmp_path / "baselines")
+    monkeypatch.setattr(scorer, "image_id", lambda tag: "sha256:image")
+
+    async def fake_invariants(
+        sbx: Any, spec: BountySpec, workspace: Any, attempts: int = 1
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        return {"unit_tests": 12}, {"auth_test": 0}, "12 passed"
+
+    monkeypatch.setattr(scorer, "_run_invariants", fake_invariants)
+    monkeypatch.setattr(
+        scorer, "_reset_state", lambda *args: asyncio.sleep(0)
+    )
+    monkeypatch.setattr(scorer, "_reapply_harness_fixes", lambda *args: asyncio.sleep(0))
+    monkeypatch.setattr(scorer, "_apply_agent_diff", lambda *args: asyncio.sleep(0))
+    workspace = Workspace(spec, tmp_path)
+
+    asyncio.run(scorer._require_invariant_baseline(None, spec, workspace, "diff"))
+
+
+def test_a_system_without_repo_invariants_is_not_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to compare: `patch` does not build these samples at all."""
+    spec = _local_spec(tmp_path)
+    repo_metadata = dict(spec.repo_metadata)
+    repo_metadata["invariant_thresholds"] = {}
+    spec = replace(spec, repo_metadata=repo_metadata)
+    monkeypatch.setattr(scorer, "BASELINE_CACHE_DIR", tmp_path / "baselines")
+    monkeypatch.setattr(scorer, "image_id", lambda tag: "sha256:image")
+
+    async def fake_invariants(*args: Any, **kwargs: Any) -> Any:
+        return {}, {}, "no repo invariants for this system"
+
+    monkeypatch.setattr(scorer, "_run_invariants", fake_invariants)
+    monkeypatch.setattr(scorer, "_reset_state", lambda *args: asyncio.sleep(0))
+    monkeypatch.setattr(scorer, "_reapply_harness_fixes", lambda *args: asyncio.sleep(0))
+    monkeypatch.setattr(scorer, "_apply_agent_diff", lambda *args: asyncio.sleep(0))
+
+    asyncio.run(
+        scorer._require_invariant_baseline(None, spec, Workspace(spec, tmp_path), "diff")
+    )
+
+
 def test_a_cached_baseline_keeps_the_passing_patch_gradable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1608,6 +1660,40 @@ def test_pin_build_mirrors_sets_the_environment_of_a_sample_that_needs_it(
     text = (root / "Dockerfile").read_text()
     assert "ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip" in text.splitlines()
     assert text.index("ONNXRUNTIME_NODE_INSTALL_CUDA") < text.index("pip install")
+
+
+def test_the_invokeai_fix_clears_the_executable_stack_of_onnxruntime(
+    tmp_path: Path,
+) -> None:
+    """The wheel asks for an executable stack, which trixie's glibc refuses."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "Dockerfile").write_text(
+        'FROM python:3.11\nRUN pip install -e ".[test]"\nENTRYPOINT ["invokeai-web"]\n'
+    )
+
+    pin_build_mirrors(root, fix=environment.BUILD_FIXES["InvokeAI"])
+
+    text = (root / "Dockerfile").read_text()
+    assert "patchelf --clear-execstack" in text
+    assert "onnxruntime_pybind11_state*.so" in text
+    # the flag has to be cleared after the interpreter installed the package
+    assert text.index("patchelf") > text.index('pip install -e ".[test]"')
+
+
+def test_paddle_is_unavailable_only_in_patch() -> None:
+    """Its invariant suite downloads from the internet; the other task types run."""
+    assert "paddle_bounty_0" in UNAVAILABLE_SAMPLES["patch"]
+    assert "paddle_bounty_0" not in UNAVAILABLE_SAMPLES.get("detect", {})
+    assert "paddle_bounty_0" not in UNAVAILABLE_SAMPLES.get("exploit", {})
+
+
+def test_the_librechat_grading_installs_sharp_from_the_npm_mirror() -> None:
+    """`sharp` fetches libvips from github, which the run stage cannot reach."""
+    assert (
+        "npm_config_sharp_libvips_binary_host",
+        "https://registry.npmmirror.com/-/binary/sharp-libvips",
+    ) in environment.GRADING_ENV["LibreChat"]
 
 
 def test_the_open_webui_fix_skips_the_onnxruntime_cuda_download() -> None:

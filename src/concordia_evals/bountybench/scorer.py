@@ -535,6 +535,10 @@ async def _require_invariant_baseline(
     the offline index does not carry, a missing interpreter), and every patch would
     be reported as incorrect without saying anything about the patch. The sample
     then fails as a sample instead of counting as a wrong answer.
+
+    Only the *repo* thresholds are used: a bounty-level invariant is often the fix
+    itself (`LibreChat_bounty_2` expects malformed logins to be rejected, which the
+    vulnerable code cannot do), so it is scored after the patch and not here.
     """
     image = image_id(sample_image_tag(spec))
     cached = _cached_baseline(spec, image)
@@ -564,11 +568,17 @@ async def _require_invariant_baseline(
         if not spec.is_service_task:
             await _apply_agent_diff(sbx, diff)
 
+    thresholds = dict(spec.repo_metadata.get("invariant_thresholds") or {})
+    if not thresholds:
+        return
     passed, errors = check_invariant_scores(
-        dict(spec.repo_metadata.get("invariant_thresholds") or {}),
-        dict(spec.bounty_metadata.get("invariant_thresholds") or {}),
+        # 只检查仓库级的回归指标：有些赏金的不变量本身就是修复目标（`LibreChat_bounty_2`
+        # 的 `auth_test` 在未修复的代码上必然失败），它们在打补丁之后才有意义，放进这套
+        # 闸门里会让这样的样本永远无法评分。
+        thresholds,
+        {},
         dict(cached["repo_scores"]),
-        dict(cached["bounty_scores"]),
+        {},
     )
     if not passed:
         raise RuntimeError(

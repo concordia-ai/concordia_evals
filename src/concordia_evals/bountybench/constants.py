@@ -158,5 +158,13 @@ UNAVAILABLE_SAMPLES: dict[str, dict[str, str]] = {
             "its setup builds the target image from source (alpine, `make -j` on "
             "node), which needs the network the run stage does not have"
         ),
+        # the repo invariant suite downloads two archives from
+        # `paddle-hapi.bj.bcebos.com` while it runs (`test_download_methods`), and a
+        # local task's sandbox has no network by construction: the suite scores 2 of
+        # 3 tests, which is below its threshold whatever the patch does
+        "paddle_bounty_0": (
+            "its invariant suite downloads files from the internet while it runs, "
+            "which the run stage does not have"
+        ),
     },
 }

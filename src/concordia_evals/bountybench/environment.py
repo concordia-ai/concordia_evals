@@ -570,6 +570,18 @@ GRADING_ENV: dict[str, tuple[tuple[str, str], ...]] = {
     # makes the `-Wincompatible-pointer-types` the generated C code raises fatal
     # (`PyArray_DATA(PyObject *)` in `wcslib`'s wrappers aborts the build).
     "astropy": (("CFLAGS", "-Wno-error=incompatible-pointer-types -Wno-error"),),
+    # the suite's own `npm install` runs at grading time (it installs the backend's
+    # workspace packages), and `sharp` 0.32 downloads the libvips archive from the
+    # GitHub release page when it has no prebuilt binary for the platform: the run
+    # stage cannot reach github.com (`sharp: Installation error: aborted`), which
+    # leaves `packages/data-provider` unbuilt and the suite without a score. The
+    # npm registry mirror carries the same archives.
+    "LibreChat": (
+        (
+            "npm_config_sharp_libvips_binary_host",
+            "https://registry.npmmirror.com/-/binary/sharp-libvips",
+        ),
+    ),
 }
 
 GRADING_SETUP: dict[str, tuple[str, ...]] = {
@@ -2322,6 +2334,25 @@ SECURITY_ARCHIVE = "http://snapshot.debian.org/archive/debian-security/20260201T
 # and the image of the target stack cannot be built at all.
 BUILD_FIXES: dict[str, BuildFix] = {
     "gradio": BuildFix(constraints=("huggingface_hub<0.30",)),
+    # `onnxruntime==1.16.3`, which this checkout pins, ships a wheel whose
+    # extension asks for an executable stack; Debian trixie's glibc 2.41 refuses to
+    # load it (`cannot enable executable stack as shared object requires`), so
+    # `invokeai-web` dies on import and nothing of the sample runs (its `detect`
+    # attempt failed with a dead server). The flag is an artefact of the way the
+    # wheel was built — the code does not run from the stack — and clearing it is
+    # enough. The later checkout of `InvokeAI_bounty_1` pins 1.19.2, which does not
+    # need it.
+    "InvokeAI": BuildFix(
+        replace=(
+            (
+                'RUN pip install -e ".[test]"',
+                'RUN pip install -e ".[test]" && pip install --quiet patchelf'
+                " && patchelf --clear-execstack"
+                " /usr/local/lib/python3.11/site-packages/onnxruntime/capi"
+                "/onnxruntime_pybind11_state*.so",
+            ),
+        )
+    ),
     "pytorch-lightning": BuildFix(constraints=("setuptools<81",)),
     # `requirements.txt` pins `protobuf==3.20` and leaves `pyautogen` unpinned,
     # while the current release of it needs protobuf 5
