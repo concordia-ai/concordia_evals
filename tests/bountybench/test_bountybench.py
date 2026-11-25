@@ -246,6 +246,30 @@ def test_check_invariant_scores_merges_bounty_thresholds() -> None:
     assert any("unit_tests score (11) is below threshold (12)" in e for e in errors)
 
 
+def test_repo_invariant_thresholds_carry_the_calibration(tmp_path: Path) -> None:
+    """上游阈值在本快照上达不到的系统，用校准值；其余系统原样。"""
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    assert scorer.repo_invariant_thresholds(spec) == {"healthcheck": 1, "unit_tests": 10}
+    calibrated = replace(spec, system="langchain")
+    assert (
+        scorer.repo_invariant_thresholds(calibrated)["unit_tests_langchain"]
+        == scorer.REPO_THRESHOLD_OVERRIDES["langchain"]["unit_tests_langchain"]
+    )
+
+
+def test_bounty_invariant_thresholds_drop_the_unreachable_ones(tmp_path: Path) -> None:
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    assert scorer.bounty_invariant_thresholds(spec) == {"unit_tests": 12}
+    dropped = replace(
+        spec,
+        system="agentscope",
+        bounty_metadata={**spec.bounty_metadata, "invariant_thresholds": {"apicheck": 1}},
+    )
+    assert scorer.bounty_invariant_thresholds(dropped) == {}
+
+
 def test_check_invariant_scores_passes_at_threshold() -> None:
     passed, errors = check_invariant_scores({"unit_tests": 10}, {}, {"unit_tests": 10}, {})
 
@@ -724,6 +748,91 @@ def test_run_host_tolerates_binary_script_output() -> None:
 
     assert result.returncode == 0
     assert "\ufffd" in result.stdout
+
+
+def test_preparing_the_invariants_runs_in_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`undici` 的校验要先用仓库自己的构建产出 `undici-fetch.js`。"""
+    spec = replace(_spec(_make_bounty_tasks_tree(tmp_path)), system="undici")
+    local = replace(spec, repo_metadata={"invariant_thresholds": {"unit_tests": 10}})
+    assert local.is_service_task is False
+    commands: list[tuple[str, str | None]] = []
+
+    async def fake_sh(sbx, command, cwd=None, timeout=None):
+        commands.append((command, cwd))
+        return ExecResult(success=True, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(scorer, "sh", fake_sh)
+
+    log = asyncio.run(scorer._prepare_invariants(None, local, None, Path("/app/codebase")))
+
+    assert [command for command, _ in commands] == list(
+        scorer.INVARIANT_PREPARATIONS["undici"]
+    )
+    assert all(cwd == "/app/codebase" for _, cwd in commands)
+    assert "undici-fetch.js" in log
+
+
+def test_preparing_the_invariants_of_a_service_task_uses_the_grader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """服务类任务在评分容器里跑准备命令（`undici` 就是这样）。"""
+    spec = replace(_spec(_make_bounty_tasks_tree(tmp_path)), system="undici")
+    assert spec.is_service_task is True
+    calls: list[tuple[Path, str]] = []
+
+    workspace = Workspace(spec, tmp_path)
+    monkeypatch.setattr(
+        workspace,
+        "run_command",
+        lambda directory, command, timeout=None: calls.append((directory, command))
+        or ExecResult(success=True, returncode=0, stdout="", stderr=""),
+    )
+
+    async def fake_to_thread(fn, *args):  # 直接执行，别开线程
+        return fn(*args)
+
+    monkeypatch.setattr(scorer.asyncio, "to_thread", fake_to_thread)
+
+    asyncio.run(scorer._prepare_invariants(None, spec, workspace, tmp_path / "codebase"))
+
+    assert [command for _, command in calls] == list(scorer.INVARIANT_PREPARATIONS["undici"])
+    assert all(directory == tmp_path / "codebase" for directory, _ in calls)
+
+
+def test_preparing_the_invariants_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = replace(
+        replace(_spec(_make_bounty_tasks_tree(tmp_path)), system="undici"),
+        repo_metadata={"invariant_thresholds": {"unit_tests": 10}},
+    )
+    assert spec.is_service_task is False
+
+    async def fake_sh(sbx, command, cwd=None, timeout=None):
+        return ExecResult(success=False, returncode=127, stdout="", stderr="no npm")
+
+    monkeypatch.setattr(scorer, "sh", fake_sh)
+
+    with pytest.raises(RuntimeError, match="no npm"):
+        asyncio.run(scorer._prepare_invariants(None, spec, None, Path("/app/codebase")))
+
+
+def test_systems_without_preparation_are_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    async def fake_sh(sbx, command, cwd=None, timeout=None):  # pragma: no cover
+        raise AssertionError("no command should run")
+
+    monkeypatch.setattr(scorer, "sh", fake_sh)
+
+    assert (
+        asyncio.run(scorer._prepare_invariants(None, spec, None, Path("/app/codebase")))
+        == ""
+    )
 
 
 class _FakeFileSandbox:

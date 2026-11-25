@@ -702,8 +702,10 @@ NPM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "parse-url": (),
     "yaml": (),
     # this one's suite also installs a package from the task directory, which is a
-    # bind mount at run time, so it has to be in the cache as well
-    "undici": ("@matteo.collina/tspl",),
+    # bind mount at run time, so it has to be in the cache as well. `esbuild` is the
+    # bundler behind the checkout's `build:node`（`npx esbuild@0.19.4`），不缓存它
+    # 离线构建产物就做不出来，8 个测试文件也就整文件丢失。
+    "undici": ("@matteo.collina/tspl", "esbuild@0.19.4"),
 }
 
 for _system in NPM_DEPENDENCIES:
@@ -2097,6 +2099,17 @@ class Workspace:
         self, directory: Path, script: str, timeout: int | None = None
     ) -> ExecResult[str]:
         """Run one of the task's shell scripts in the grading container."""
+        return self._exec_in_grader(directory, script_command(script), timeout)
+
+    def run_command(
+        self, directory: Path, command: str, timeout: int | None = None
+    ) -> ExecResult[str]:
+        """Run a shell command in the grading container (not one of the scripts)."""
+        return self._exec_in_grader(directory, f"exec bash -lc {shlex.quote(command)}", timeout)
+
+    def _exec_in_grader(
+        self, directory: Path, command: str, timeout: int | None = None
+    ) -> ExecResult[str]:
         self.apply_code()
         container = self._ensure_grader_container()
         self._expose_stack(container)
@@ -2117,7 +2130,7 @@ class Workspace:
                     container,
                     "bash",
                     "-c",
-                    script_command(script),
+                    command,
                 ],
                 timeout=timeout,
             )
@@ -2375,6 +2388,14 @@ SECURITY_ARCHIVE = "http://snapshot.debian.org/archive/debian-security/20260201T
 # release of an unpinned dependency (or to a repository that has been dropped),
 # and the image of the target stack cannot be built at all.
 BUILD_FIXES: dict[str, BuildFix] = {
+    # `victim.py` 用 `agentscope.studio.init(...)` 起服务，而那条导入链需要 `tqdm` 与
+    # `chainlit`：两者既不在 `setup.py` 的 `minimal_requires` 里、也不在任何 extra 里，
+    # `pip install -e .` 之后 `import agentscope.studio` 直接 ModuleNotFoundError。
+    # victim 容器于是永远起不来（healthcheck 一直 unhealthy），而样本的
+    # `run_repo_invariants.sh` 是 `set -e` + curl 探活：连不上就直接退，一条分数都不写。
+    "agentscope": BuildFix(
+        replace=(("RUN pip install -e .", "RUN pip install -e . && pip install tqdm chainlit"),),
+    ),
     "gradio": BuildFix(constraints=("huggingface_hub<0.30",)),
     # `onnxruntime==1.16.3`, which this checkout pins, ships a wheel whose
     # extension asks for an executable stack; Debian trixie's glibc 2.41 refuses to
