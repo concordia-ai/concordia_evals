@@ -89,6 +89,21 @@ GIT_IDENTITY = "-c user.email=bountybench@example.com -c user.name=bountybench"
 _LIVE_WORKSPACES: dict[str, "Workspace"] = {}
 
 
+# BuildKit does not forward the proxy of the client environment to `RUN`, and some
+# builds reach hosts no mirror carries (`pypi.org`, `huggingface.co`). The evaluation
+# runs with the proxy in its environment, so pass it explicitly.
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY")
+
+
+def proxy_build_args() -> list[str]:
+    args: list[str] = []
+    for name in PROXY_VARIABLES:
+        value = os.environ.get(name)
+        if value:
+            args += ["--build-arg", f"{name}={value}"]
+    return args
+
+
 def run_host(
     command: list[str],
     cwd: Path | None = None,
@@ -252,6 +267,7 @@ def ensure_agent_image(tag: str = AGENT_IMAGE) -> None:
         [
             "docker",
             "build",
+            *proxy_build_args(),
             "--tag",
             tag,
             "--file",
@@ -570,6 +586,9 @@ GRADING_ENV: dict[str, tuple[tuple[str, str], ...]] = {
     "langchain": (
         ("POETRY_VIRTUALENVS_PATH", "/root/.cache/pypoetry/virtualenvs"),
         ("POETRY_VIRTUALENVS_IN_PROJECT", "false"),
+        # 模型已经下载进镜像（见 GRADING_SETUP）：离线时 transformers 只读缓存，
+        # 不然它还会去 huggingface.co 做一次 HEAD，失败后直接报错。
+        ("HF_HUB_OFFLINE", "1"),
     ),
     # tiktoken downloads the `cl100k_base` table on first use; the run stage is
     # offline, so it reads it from the copy the image caches instead.
@@ -609,6 +628,15 @@ GRADING_SETUP: dict[str, tuple[str, ...]] = {
     # would repeat the resolution against pypi.org for nothing.
     "langchain": (
         "pip install --quiet poetry poetry-plugin-export",
+        # 参考 exploit 用 `HuggingFaceEmbeddings`（`sentence-transformers/
+        # all-MiniLM-L6-v2`）算 embedding，运行阶段没有网：模型要事先下进镜像，
+        # 配合 `HF_HUB_OFFLINE` 让 transformers 只读缓存。
+        # `HF_HUB_OFFLINE` 在这个 RUN 之前就被 ENV 打开了（运行阶段要它），下载这一步
+        # 必须显式关掉它，否则 snapshot_download 直接拒连。
+        "pip install --quiet huggingface_hub"
+        " && HF_HOME=/root/.cache/huggingface HF_HUB_OFFLINE=0 python3 -c \""
+        "from huggingface_hub import snapshot_download;"
+        " snapshot_download('sentence-transformers/all-MiniLM-L6-v2')\"",
         *(
             f"(cd libs/{library} && poetry env use python3.9"
             " && poetry export --with test --without-hashes -f requirements.txt"
@@ -705,7 +733,10 @@ NPM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     # bind mount at run time, so it has to be in the cache as well. `esbuild` is the
     # bundler behind the checkout's `build:node`（`npx esbuild@0.19.4`），不缓存它
     # 离线构建产物就做不出来，8 个测试文件也就整文件丢失。
-    "undici": ("@matteo.collina/tspl", "esbuild@0.19.4"),
+    # `express` 是赏金参考 exploit 自己要 `npm install -g express` 装的（它还要 nvm
+    # 联网装 node，运行阶段没网）：缓存里没有它，exploit 就永远跑不起来，而
+    # `verify.sh` 在 exploit 跑不起来时也返回 1 —— 那会被当成“补丁生效”。
+    "undici": ("@matteo.collina/tspl", "esbuild@0.19.4", "express"),
 }
 
 for _system in NPM_DEPENDENCIES:
@@ -983,7 +1014,10 @@ def wheelhouse_script(
     """
     lines = ["#!/bin/bash", "set -o pipefail", f"mkdir -p {SANDBOX_WHEELHOUSE}"]
     baseline = " ".join(WHEELHOUSE_BASELINE)
-    lines.append(f"pip download -q -d {SANDBOX_WHEELHOUSE} {baseline} || true")
+    lines.append(
+        f"pip download -q --timeout 60 --retries 2 -d {SANDBOX_WHEELHOUSE}"
+        f" {baseline} || true"
+    )
     extra = [
         requirement
         for requirement in requirements
@@ -996,11 +1030,14 @@ def wheelhouse_script(
         # wheelhouse then holds two versions of a package they disagree on.
         # Wheels only first: the image has no toolchain to build an sdist.
         lines.append(
-            f"pip download -q --only-binary=:all: -d {SANDBOX_WHEELHOUSE} {quoted} "
-            f"|| pip download -q -d {SANDBOX_WHEELHOUSE} {quoted} || {{"
+            f"pip download -q --timeout 60 --retries 2 --only-binary=:all:"
+            f" -d {SANDBOX_WHEELHOUSE} {quoted} "
+            f"|| pip download -q --timeout 60 --retries 2 -d {SANDBOX_WHEELHOUSE}"
+            f" {quoted} || {{"
         )
         lines.extend(
-            f"  pip download -q -d {SANDBOX_WHEELHOUSE} {shlex.quote(requirement)} "
+            f"  pip download -q --timeout 60 --retries 2 -d {SANDBOX_WHEELHOUSE}"
+            f" {shlex.quote(requirement)} "
             f'|| echo "MISSING {requirement}"'
             for requirement in extra
         )
@@ -1012,9 +1049,11 @@ def wheelhouse_script(
         # down, and the fallback without `--only-binary` still gets the sdist,
         # which the image can build.
         lines.extend(
-            f"pip download -q --only-binary=:all: --python-version {version} "
+            f"pip download -q --timeout 60 --retries 2 --only-binary=:all:"
+            f" --python-version {version} "
             f"-d {SANDBOX_WHEELHOUSE} {shlex.quote(requirement)} "
-            f"|| pip download -q --python-version {version} -d {SANDBOX_WHEELHOUSE} "
+            f"|| pip download -q --timeout 60 --retries 2 --python-version {version}"
+            f" -d {SANDBOX_WHEELHOUSE} "
             f"{shlex.quote(requirement)} "
             f'|| echo "MISSING {version} {requirement}"'
             for requirement in extra
@@ -1043,14 +1082,16 @@ def wheelhouse_script(
     for requirement in sdists:
         # `easy_install` installs sdists only, and skips an installed requirement
         lines.append(
-            f"pip download -q --no-binary=:all: -d {SANDBOX_WHEELHOUSE} "
+            f"pip download -q --timeout 60 --retries 2 --no-binary=:all:"
+            f" -d {SANDBOX_WHEELHOUSE} "
             f'{shlex.quote(requirement)} || echo "MISSING {requirement}"'
         )
     for path in local:
         target = codebase_relative(path)
         lines.append(
-            f"(cd {SANDBOX_CODEBASE_DIR} && pip download -q -d {SANDBOX_WHEELHOUSE} "
-            f'{shlex.quote(target)}) || echo "MISSING {path}"'
+            f"(cd {SANDBOX_CODEBASE_DIR} && pip download -q --timeout 60 --retries 2"
+            f" -d {SANDBOX_WHEELHOUSE} {shlex.quote(target)})"
+            f' || echo "MISSING {path}"'
         )
     return "\n".join(lines) + "\n"
 
@@ -1349,6 +1390,7 @@ def ensure_sample_image(spec: BountySpec, cache_dir: Path = SAMPLE_IMAGES_DIR) -
         [
             "docker",
             "build",
+            *proxy_build_args(),
             "--tag",
             tag,
             "--file",
@@ -1743,6 +1785,7 @@ class Workspace:
                 [
                     "docker",
                     "build",
+                    *proxy_build_args(),
                     "--tag",
                     build.image,
                     "--label",

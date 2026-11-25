@@ -566,11 +566,12 @@ def test_grading_requirements_are_taken_from_the_task_scripts(tmp_path: Path) ->
 def test_wheelhouse_script_downloads_every_requirement(tmp_path: Path) -> None:
     script = wheelhouse_script(["pytest", "numpy<2"], ["./codebase", "libs/core"])
 
-    assert "pip download -q -d /opt/wheels pytest" in script
+    assert "pip download -q --timeout 60 --retries 2 -d /opt/wheels pytest" in script
     assert "'numpy<2'" in script
     # the scripts run from the task directory, the image checkout is the mount
-    assert "(cd /app/codebase && pip download -q -d /opt/wheels .)" in script
-    assert "(cd /app/codebase && pip download -q -d /opt/wheels ./libs/core)" in script
+    assert "(cd /app/codebase && pip download -q --timeout 60 --retries 2" in script
+    assert "-d /opt/wheels .)" in script
+    assert "-d /opt/wheels ./libs/core)" in script
     assert "MISSING" in script
     assert "setuptools_scm" in script
 
