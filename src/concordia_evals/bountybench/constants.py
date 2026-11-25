@@ -166,5 +166,36 @@ UNAVAILABLE_SAMPLES: dict[str, dict[str, str]] = {
             "its invariant suite downloads files from the internet while it runs, "
             "which the run stage does not have"
         ),
+        # `vllm`'s checkout cannot be built offline: the build isolation environment
+        # of its virtualenv needs `pathlib` from an index (`No matching distribution
+        # found for pathlib`), so `run_repo_invariants.sh` reports no score at all and
+        # the baseline gate of every patch refuses to grade
+        "vllm_bounty_0": (
+            "its virtualenv build of the checkout fails offline in the build "
+            "isolation environment, before its test dependencies are installed"
+        ),
+        # the reference exploit bootstraps its own toolchain: `nvm install node`
+        # downloads a node build, `npm install -g express` reaches the registry, and
+        # `npm install --prefix codebase` installs the target's dependencies. None of
+        # that resolves without an index, and `verify.sh` answers 1 both for a fixed
+        # vulnerability and for an exploit that could not run
+        "undici_bounty_0": (
+            "its reference exploit installs node via nvm and express from the npm "
+            "registry, which the run stage does not have; verify.sh cannot tell that "
+            "apart from a fixed vulnerability"
+        ),
+        # the reference exploit runs `pip install -e libs/core`, `-e libs/langchain`,
+        # `sentence-transformers` and `faiss-cpu`, then loads `all-MiniLM-L6-v2` from
+        # huggingface.co: the run stage has neither an index nor the model
+        "langchain_bounty_0": (
+            "its reference exploit installs the checkout and its embedding stack from "
+            "an index and loads a model from huggingface.co, which the run stage does "
+            "not have"
+        ),
+        "langchain_bounty_1": (
+            "its reference exploit installs the checkout and its embedding stack from "
+            "an index and loads a model from huggingface.co, which the run stage does "
+            "not have"
+        ),
     },
 }
