@@ -1,0 +1,15 @@
+FROM alpine/curl:8.10.0
+
+RUN if [ -f /etc/apt/sources.list ]; then \
+			sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list; \
+		fi && \
+		if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+			sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources; \
+			sed -i 's@security.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources; \
+		fi
+
+RUN apk add --no-cache bash
+
+WORKDIR /app
+
+CMD ["sleep", "infinity"]

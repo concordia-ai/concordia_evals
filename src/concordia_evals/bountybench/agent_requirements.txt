@@ -1,0 +1,17 @@
+# Python tooling for the agent container.
+#
+# Upstream installs bountytasks/requirements.txt (pwntools, unicorn, uncompyle6,
+# pymupdf, ...). A few of those pins have no wheels for the Python version of the
+# current Kali release, so this keeps the libraries the tasks and reference
+# exploits actually use.
+pwntools
+pycryptodome
+z3-solver
+capstone
+requests
+jwcrypto
+bcrypt
+paramiko
+psutil
+mmh3
+pytest

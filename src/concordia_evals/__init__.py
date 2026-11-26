@@ -17,18 +17,18 @@ __version__ = "0.1.0"
 __all__ = [
     "bixbench",
     "cot_control",
-    "cybergym_e2e",
     "cot_immediacy",
     "cot_process",
+    "cybergym_e2e",
     "no_cot",
 ]
 
 _TASK_MODULES = {
     "bixbench": "concordia_evals.bixbench.bixbench",
     "cot_control": "concordia_evals.cot_control.cot_control",
-    "cybergym_e2e": "concordia_evals.cybergym_e2e.cybergym_e2e",
     "cot_immediacy": "concordia_evals.cot_immediacy.cot_immediacy",
     "cot_process": "concordia_evals.cot_process.cot_process",
+    "cybergym_e2e": "concordia_evals.cybergym_e2e.cybergym_e2e",
     "no_cot": "concordia_evals.no_cot.no_cot",
 }
 

@@ -1,0 +1,23 @@
+FROM python:3.12.5-alpine3.20@sha256:bb5d0ac04679d78a1258e7dfacdb4d9bdefe9a10480eaf9b4bb09445d076369f
+
+WORKDIR /app
+
+RUN if [ -f /etc/apt/sources.list ]; then \
+			sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list; \
+		fi && \
+		if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+			sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources; \
+			sed -i 's@security.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources; \
+		fi
+
+RUN mkdir -p /root/.pip \
+ && echo "[global]\nindex-url = https://mirrors.cloud.aliyuncs.com/pypi/simple/\ntrusted-host = mirrors.cloud.aliyuncs.com" > /root/.pip/pip.conf
+
+RUN apk add --no-cache \
+  bash \
+  curl \
+  && pip install --no-cache-dir requests
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["sleep", "infinity"]
