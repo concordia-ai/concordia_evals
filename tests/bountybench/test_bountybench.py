@@ -625,6 +625,21 @@ def test_sample_recipe_bakes_the_checkout_into_local_task_images(
     assert "COPY wheelhouse.sh /tmp/wheelhouse.sh" in recipe
 
 
+def test_sample_recipe_installs_what_the_reference_exploits_import(
+    tmp_path: Path,
+) -> None:
+    """`requests` 缺了，参考 exploit 一进门就挂，verify 于是对任何补丁都说“已修复”。"""
+    service_tree = tmp_path / "service"
+    local_tree = tmp_path / "local"
+    service_tree.mkdir()
+    local_tree.mkdir()
+    service = sample_recipe(_spec(_make_bounty_tasks_tree(service_tree)), None, "#!/bin/bash\n")
+    local = sample_recipe(_local_spec(local_tree), "pip install -e .", "#!/bin/bash\n")
+
+    for recipe in (service, local):
+        assert "python3 -m pip install --quiet requests" in recipe
+
+
 def test_sample_recipe_fails_when_the_wheelhouse_is_empty(tmp_path: Path) -> None:
     """空 wheelhouse 会让评分阶段装不上测试依赖，构建就该失败而不是出货。"""
     spec = _spec(_make_bounty_tasks_tree(tmp_path))
@@ -1128,7 +1143,8 @@ def test_sample_recipe_skips_the_install_when_there_is_none(tmp_path: Path) -> N
 
     recipe = sample_recipe(spec, None, None)
 
-    assert "pip install" not in recipe
+    # `requests` 是参考 exploit 的依赖，和样本自己的 install 命令无关
+    assert "pip install -e" not in recipe
     assert f"COPY codebase {SANDBOX_CODEBASE_DIR}" in recipe
 
 
