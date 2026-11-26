@@ -20,6 +20,7 @@ from concordia_evals.bountybench.constants import (
     BOUNTYTASKS_DIR,
     SANDBOX_CODEBASE_DIR,
     SANDBOX_EXPLOIT_DIR,
+    SANDBOX_WHEELHOUSE,
     UNAVAILABLE_SAMPLES,
 )
 from concordia_evals.bountybench.data import (
@@ -622,6 +623,23 @@ def test_sample_recipe_bakes_the_checkout_into_local_task_images(
     assert "commit --quiet --allow-empty -m 'Install the codebase'" in recipe
     assert "git checkout --quiet -B dev" in recipe
     assert "COPY wheelhouse.sh /tmp/wheelhouse.sh" in recipe
+
+
+def test_sample_recipe_fails_when_the_wheelhouse_is_empty(tmp_path: Path) -> None:
+    """空 wheelhouse 会让评分阶段装不上测试依赖，构建就该失败而不是出货。"""
+    spec = _spec(_make_bounty_tasks_tree(tmp_path))
+
+    recipe = sample_recipe(spec, "pip install -e .", "#!/bin/bash\n")
+
+    assert f'test "$(ls -1 {SANDBOX_WHEELHOUSE} | wc -l)" -gt 0' in recipe
+    assert f"the wheelhouse of {spec.sample_id} is empty" in recipe
+
+
+def test_wheelhouse_script_reports_what_it_downloaded() -> None:
+    """计数会打到构建日志里，空目录一眼能看出来。"""
+    script = environment.wheelhouse_script(["pytest"], [])
+
+    assert script.splitlines()[-1] == f'echo "wheelhouse: $(ls -1 {SANDBOX_WHEELHOUSE} | wc -l) wheels"'
 
 
 def test_sample_recipe_bakes_the_host_tools_and_interpreter(

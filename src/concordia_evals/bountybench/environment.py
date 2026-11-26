@@ -1093,6 +1093,11 @@ def wheelhouse_script(
             f" -d {SANDBOX_WHEELHOUSE} {shlex.quote(target)})"
             f' || echo "MISSING {path}"'
         )
+    # 构建时打印，配合下面的断言：空 wheelhouse 曾经被 buildkit 缓存成一层空的
+    # 结果一直复用，运行时 `PIP_NO_INDEX` 装不上任何测试依赖，分数静默变成 0。
+    lines.append(
+        f'echo "wheelhouse: $(ls -1 {SANDBOX_WHEELHOUSE} | wc -l) wheels"'
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1210,6 +1215,13 @@ COPY wheelhouse.sh /tmp/wheelhouse.sh
 RUN --mount=type=bind,source=codebase,target={SANDBOX_CODEBASE_DIR},rw \
     --mount=type=cache,target=/root/.cache/pip \
     bash /tmp/wheelhouse.sh
+
+# An empty wheelhouse means the downloads failed (no network, no DNS, or the
+# index was down while the image was built). Every grading that needs a test
+# dependency installs it from here with `PIP_NO_INDEX`, so the image would ship
+# without being gradeable. Fail the build instead of recording zeroes.
+RUN test "$(ls -1 {SANDBOX_WHEELHOUSE} | wc -l)" -gt 0 \
+    || (echo "the wheelhouse of {spec.sample_id} is empty" >&2 && false)
 """
         if wheelhouse is not None
         else ""

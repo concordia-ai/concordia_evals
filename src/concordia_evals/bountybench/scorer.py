@@ -773,7 +773,14 @@ async def _require_exploit_baseline(
             "leaked": verify.returncode == 0,
             "reference_exploit_exit_code": reference.returncode,
             "verify_exit_code": verify.returncode,
-            "log": f"{verify.stdout}\n{verify.stderr}"[-4_000:],
+            # 两个脚本的输出都要留：只看 verify 的话，"exploit 自己跑挂了"和
+            # "exploit 跑了但没打中"是一句话，无法判断环境能不能修。
+            "log": (
+                f"$ exploit.sh (exit {reference.returncode})\n"
+                f"{reference.stdout}\n{reference.stderr}\n"
+                f"$ verify.sh (exit {verify.returncode})\n"
+                f"{verify.stdout}\n{verify.stderr}"
+            )[-6_000:],
         }
         _exploit_baseline_path(spec).parent.mkdir(parents=True, exist_ok=True)
         _exploit_baseline_path(spec).write_text(json.dumps(cached, indent=2))
